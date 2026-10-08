@@ -252,6 +252,41 @@ jobs:
         terraform init -no-color 2>&1 | inert
         terraform plan -no-color 2>&1 | inert
 
+    - name: 'Claim: the sandbox example in Getting started shows no warning in the sandbox, and its error message outside it'
+      env:
+        TF_DATA_DIR: ${{ runner.temp }}/terraform/readme-sandbox
+      run: |
+        # The example as the README shows it, in a root's main.tf, as the
+        # README says to put it.
+        root="$GITHUB_WORKSPACE/readme-sandbox"
+        mkdir -p "$root"
+        awk '/^To see the sandbox at work/ { found = 1 }
+             found && /^```hcl$/ { inside = 1; next }
+             inside && /^```$/ { exit }
+             inside' README.md > "$root/main.tf"
+        grep -q 'check "sandbox"' "$root/main.tf"
+        cd "$root"
+
+        terraform init -no-color 2>&1 | inert
+        terraform plan -no-color > "$RUNNER_TEMP/out.txt" 2>&1 || { inert "$RUNNER_TEMP/out.txt"; exit 1; }
+        inert "$RUNNER_TEMP/out.txt"
+        if grep -q 'Warning:' "$RUNNER_TEMP/out.txt"; then
+          echo "::error::The example shows a warning in the sandbox."
+          exit 1
+        fi
+
+        # The control. Outside the sandbox, the example must show its error
+        # message. The second `terraform` on the PATH is the one the sandbox
+        # wraps.
+        real=$(type -ap terraform | sed -n 2p)
+        [ -n "$real" ] && [ "$real" != "$(command -v terraform)" ]
+        "$real" plan -no-color > "$RUNNER_TEMP/out.txt" 2>&1 || { inert "$RUNNER_TEMP/out.txt"; exit 1; }
+        inert "$RUNNER_TEMP/out.txt"
+        if ! grep -q 'Terraform code can read its own environment.' "$RUNNER_TEMP/out.txt"; then
+          echo "::error::Outside the sandbox, the example does not show its error message, so it proves nothing."
+          exit 1
+        fi
+
     - name: "Claim: programs that Terraform starts do not get the runner's own variables, such as the token that requests OIDC tokens"
       working-directory: test/claims/runner-variables
       env:
