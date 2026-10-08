@@ -66,7 +66,7 @@ else
 
   (."environment-variables" // {} |
     if type != "object" then
-      "`environment-variables` must be a map from a variable's name to a secret's name, or to `{ variable: NAME }`."
+      "`environment-variables` must be a map from an environment variable's name to `{ variable: NAME }`."
     else
       to_entries[] |
       if (.key | identifier | not) then
@@ -81,8 +81,8 @@ else
       # ones, so this job's environment shows them.
       elif (.key as $name | $name | startswith("GITHUB_") and ($ENV | has($name))) then
         "`\(.key)` is set by the runner. It cannot be set here."
-      elif (.value | identifier or (type == "object" and keys == ["variable"] and (.variable | identifier)) | not) then
-        "`environment-variables.\(.key)` must be a secret's name, or `{ variable: NAME }`."
+      elif (.value | type == "object" and keys == ["variable"] and (.variable | identifier) | not) then
+        "`environment-variables.\(.key)` must be `{ variable: NAME }`. The pipeline is not given secrets to export."
       else empty end
     end),
 
@@ -91,14 +91,14 @@ else
       if type != "object" then
         "`private-modules` must be a map."
       else
-        (keys[] | select(IN("owner", "client-id", "private-key-secret") | not)
-          | "`private-modules.\(.)` is not a setting."),
+        (keys[] | select(IN("owner", "client-id") | not)
+          | if . == "private-key-secret" then
+              "`private-modules.private-key-secret` is not a setting. The key is always the secret TERRAFORM_PIPELINE_MODULES_APP_KEY."
+            else "`private-modules.\(.)` is not a setting." end),
         (select(has("owner") and (.owner | type != "string" or (test("^[A-Za-z0-9-]+$") | not)))
           | "`private-modules.owner` must be an organization's name."),
         (select((."client-id" | type) != "string")
-          | "`private-modules.client-id` is required. It is the GitHub App's client ID."),
-        (select(."private-key-secret" | identifier | not)
-          | "`private-modules.private-key-secret` is required. It is the name of the secret that holds the App's private key.")
+          | "`private-modules.client-id` is required. It is the GitHub App's client ID.")
       end),
     (select((try .environments.modules catch null) == null)
       | "`private-modules` needs `environments.modules`. Without it, the settings check cannot install them.")

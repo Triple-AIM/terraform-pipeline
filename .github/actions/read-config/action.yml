@@ -41,7 +41,7 @@ outputs:
     value: ${{ steps.read.outputs.approval-environment }}
   environment-variables:
     description: >-
-      A JSON map from a variable's name to a secret's name, or to
+      A JSON map from an environment variable's name to
       `{"variable": NAME}`.
     value: ${{ steps.read.outputs.environment-variables }}
   private-modules:

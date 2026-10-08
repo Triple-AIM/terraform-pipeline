@@ -39,6 +39,13 @@ on:
           the plan credentials.
         type: boolean
         default: false
+    secrets:
+      TERRAFORM_PIPELINE_MODULES_APP_KEY:
+        description: >-
+          The private key of the `private-modules` App. Pass it by this name,
+          even if it exists only in the environments. Each job that installs
+          modules then gets its environment's copy.
+        required: false
 
 permissions: {}
 
@@ -366,8 +373,8 @@ jobs:
       with:
         owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
         client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
-        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
-        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        private-key: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+        private-key-secret: TERRAFORM_PIPELINE_MODULES_APP_KEY
         environment: ${{ needs.config.outputs.modules-environment }}
 
     - name: Compare with the default branch
@@ -489,24 +496,21 @@ jobs:
       run: terraform fmt -check -recursive 2>&1 | inert
       continue-on-error: true
 
-    # The secrets and variables that the config names, exported as
-    # environment variables. The sandbox keeps Terraform code from reading its
+    # The variables that the config names, exported as environment variables. The sandbox keeps Terraform code from reading its
     # environment. The providers can read it.
     - name: Export environment variables
       uses: $/.github/actions/export-environment-variables
       with:
         variables: ${{ needs.config.outputs.environment-variables }}
-        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
         vars: ${{ toJSON(vars) }}
         environment: ${{ matrix.root.environment }}
 
     # The caller's credentials action, from the default branch, if it has one.
     # Its path is fixed, because `uses` cannot take an expression.
     #
-    # It receives the root, and the job's secrets and variables, including the
+    # It receives the root, and the job's variables, including the
     # environment's. The environment decides which credentials these are. A
-    # composite action cannot read `secrets` itself, and this workflow cannot
-    # know their names.
+    # composite action cannot read `vars` itself.
     #
     # It must export what it gives as environment variables. A file would not
     # work. The sandbox keeps Terraform, and so the providers, out of the home
@@ -516,7 +520,6 @@ jobs:
       uses: ./trusted/.github/terraform-pipeline/credentials # zizmor: ignore[self-repository] the caller's action, not this repository's
       with:
         root: ${{ matrix.root.path }}
-        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
         vars: ${{ toJSON(vars) }}
 
     - name: Let git fetch private modules
@@ -525,8 +528,8 @@ jobs:
       with:
         owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
         client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
-        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
-        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        private-key: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+        private-key-secret: TERRAFORM_PIPELINE_MODULES_APP_KEY
         environment: ${{ matrix.root.environment }}
 
     - name: Terraform Init
@@ -1007,7 +1010,6 @@ jobs:
       uses: $/.github/actions/export-environment-variables
       with:
         variables: ${{ needs.config.outputs.environment-variables }}
-        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
         vars: ${{ toJSON(vars) }}
         environment: ${{ needs.config.outputs.apply-environment }}
 
@@ -1016,7 +1018,6 @@ jobs:
       uses: ./trusted/.github/terraform-pipeline/credentials # zizmor: ignore[self-repository] the caller's action, not this repository's
       with:
         root: ${{ matrix.root.path }}
-        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
         vars: ${{ toJSON(vars) }}
 
     - name: Let git fetch private modules
@@ -1025,8 +1026,8 @@ jobs:
       with:
         owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
         client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
-        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
-        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        private-key: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+        private-key-secret: TERRAFORM_PIPELINE_MODULES_APP_KEY
         environment: ${{ needs.config.outputs.apply-environment }}
 
     - name: Download the plan

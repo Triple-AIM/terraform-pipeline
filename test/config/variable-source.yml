@@ -3,5 +3,4 @@ terraform-version: "1.16.1"
 providers:
   snowflakedb/snowflake:
 environment-variables:
-  SNOWFLAKE_PRIVATE_KEY: SNOWFLAKE_KEY
   SNOWFLAKE_USER: { variable: SNOWFLAKE_USER }

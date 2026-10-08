@@ -1,17 +1,14 @@
 name: 'Export environment variables'
 description: >-
   Exports environment variables, as the config's `environment-variables`
-  names them. Each value comes from a secret or from a variable. One that is
-  not set stops the job.
+  names them. Each value comes from a variable. One that is not set stops the
+  job.
 
 inputs:
   variables:
     description: >-
-      A JSON map from an environment variable's name to its source. A source
-      is a secret's name, or `{"variable": NAME}`.
-    required: true
-  secrets:
-    description: "The job's secrets as JSON."
+      A JSON map from an environment variable's name to its source,
+      `{"variable": NAME}`.
     required: true
   vars:
     description: "The job's variables as JSON."
@@ -27,7 +24,6 @@ runs:
     shell: bash
     env:
       VARIABLES: ${{ inputs.variables }}
-      SECRETS: ${{ inputs.secrets }}
       VARS: ${{ inputs.vars }}
       ENVIRONMENT: ${{ inputs.environment }}
     run: '"$GITHUB_ACTION_PATH/export.sh"' # zizmor: ignore[github-env] exporting is what this action is for

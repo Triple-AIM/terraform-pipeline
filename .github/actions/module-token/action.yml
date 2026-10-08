@@ -32,7 +32,7 @@ runs:
       ENVIRONMENT: ${{ inputs.environment }}
     run: |
       if [ -z "$KEY" ]; then
-        echo "::error::The secret $SECRET is not set in the $ENVIRONMENT environment. It is needed to fetch private modules."
+        echo "::error::The secret $SECRET is empty in the $ENVIRONMENT environment. It is needed to fetch private modules. Either the environment does not have it, or the calling workflow does not pass it."
         exit 1
       fi
 

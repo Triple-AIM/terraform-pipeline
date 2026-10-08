@@ -1,6 +1,0 @@
-# expect: `TF_VAR_api_key` would pass its value to Terraform code
-terraform-version: "1.16.1"
-providers:
-  hashicorp/random:
-environment-variables:
-  TF_VAR_api_key: API_KEY
