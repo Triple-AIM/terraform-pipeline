@@ -3,4 +3,4 @@ terraform-version: "1.16.1"
 providers:
   hashicorp/random:
 environment-variables:
-  TF_CLI_CONFIG_FILE: CONFIG
+  TF_CLI_CONFIG_FILE: { variable: CONFIG }

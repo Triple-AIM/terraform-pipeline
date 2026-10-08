@@ -1,10 +1,8 @@
-# The integrations/github provider reads its credentials from `GITHUB_`
-# names that the runner does not set.
+# The integrations/github provider reads its settings from `GITHUB_` names
+# that the runner does not set.
 terraform-version: "1.16.1"
 providers:
   integrations/github:
 environment-variables:
-  GITHUB_APP_ID: TERRAFORM_GITHUB_APP_ID
-  GITHUB_APP_INSTALLATION_ID: TERRAFORM_GITHUB_APP_INSTALLATION_ID
-  GITHUB_APP_PEM_FILE: TERRAFORM_GITHUB_APP_PEM_FILE
-  GITHUB_TOKEN: TERRAFORM_GITHUB_TOKEN
+  GITHUB_APP_ID: { variable: TERRAFORM_GITHUB_APP_ID }
+  GITHUB_APP_INSTALLATION_ID: { variable: TERRAFORM_GITHUB_APP_INSTALLATION_ID }

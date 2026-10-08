@@ -3,4 +3,4 @@ terraform-version: "1.16.1"
 providers:
   hashicorp/random:
 environment-variables:
-  GITHUB_OUTPUT: OUTPUT
+  GITHUB_OUTPUT: { variable: OUTPUT }

@@ -7,4 +7,3 @@ environments:
 private-modules:
   owner: github.com/Triple-AIM
   client-id: Iv23liexample
-  private-key-secret: MODULES_APP_KEY

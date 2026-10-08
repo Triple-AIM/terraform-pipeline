@@ -4,4 +4,3 @@ providers:
   hashicorp/random:
 private-modules:
   client-id: Iv23liexample
-  private-key-secret: MODULES_APP_KEY

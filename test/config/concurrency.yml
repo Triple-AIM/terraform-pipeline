@@ -8,5 +8,4 @@ environments:
   plan: self-test-plan
   apply: self-test-apply
 environment-variables:
-  SELF_TEST_API_KEY: SELF_TEST_API_KEY
   SELF_TEST_USER: { variable: SELF_TEST_USER }

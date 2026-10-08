@@ -14,7 +14,5 @@ environments:
 # The self-test's App, which can only read the test module's repository.
 private-modules:
   client-id: Iv23liwmfTe5Z6qNmSfH
-  private-key-secret: SELF_TEST_MODULES_APP_KEY
 environment-variables:
-  SELF_TEST_API_KEY: SELF_TEST_API_KEY
   SELF_TEST_USER: { variable: SELF_TEST_USER }

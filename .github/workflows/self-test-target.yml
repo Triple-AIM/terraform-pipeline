@@ -22,7 +22,8 @@ permissions: {}
 jobs:
   terraform:
     uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the default branch's copy, as a pinned consumer would have
-    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    secrets:
+      TERRAFORM_PIPELINE_MODULES_APP_KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
     permissions:
       actions: read
       contents: read

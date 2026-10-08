@@ -33,9 +33,10 @@ defaults:
 jobs:
   terraform:
     uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
-    # Without this, a called workflow gets no secrets. That includes the
-    # environment's secrets.
-    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    # The key exists only in the environments. Each of the pipeline's jobs
+    # gets its own environment's copy.
+    secrets:
+      TERRAFORM_PIPELINE_MODULES_APP_KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
     permissions:
       # To read the approval environment's protection rules.
       actions: read
@@ -55,7 +56,6 @@ jobs:
   concurrency-first:
     name: 'Concurrency A'
     uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
-    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
     permissions:
       actions: read
       contents: read
@@ -68,7 +68,6 @@ jobs:
   concurrency-second:
     name: 'Concurrency B'
     uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
-    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
     permissions:
       actions: read
       contents: read
@@ -104,6 +103,35 @@ jobs:
         jq -e '.jobs > 0' <<<"$a" > /dev/null && jq -e '.jobs > 0' <<<"$b" > /dev/null
         if jq -n -e --argjson a "$a" --argjson b "$b" '$a.start < $b.end and $b.start < $a.end' > /dev/null; then
           echo "::error::The two calls of the pipeline ran at the same time."
+          exit 1
+        fi
+
+  module-key:
+    name: 'Claims: module key'
+    needs: terraform
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+
+    steps:
+    - name: "Claim: the App's key can be passed by name, even if only the environments have it"
+      env:
+        # This job has no environment. So this is the key as the caller sees
+        # it.
+        KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if [ -n "$KEY" ]; then
+          echo "::error::TERRAFORM_PIPELINE_MODULES_APP_KEY is a repository or organization secret. So the call does not show that the environment's copy arrives."
+          exit 1
+        fi
+        # Each plan or apply of this root installs the private module, so
+        # each one needs the key.
+        jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+          --jq '.jobs[] | select(.name | startswith("terraform / ") and contains("(test/roots/private-module")) | {name, conclusion}' | jq -s .)
+        echo "$jobs"
+        if ! jq -e 'length > 0 and all(.[]; .conclusion == "success")' <<<"$jobs" > /dev/null; then
+          echo "::error::A job that installs the private module did not succeed, or none ran."
           exit 1
         fi
 
@@ -162,8 +190,8 @@ jobs:
       with:
         owner: ${{ github.repository_owner }}
         client-id: ${{ steps.app.outputs.client-id }}
-        private-key: ${{ secrets.SELF_TEST_MODULES_APP_KEY }}
-        private-key-secret: SELF_TEST_MODULES_APP_KEY
+        private-key: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+        private-key-secret: TERRAFORM_PIPELINE_MODULES_APP_KEY
         environment: self-test-modules
 
     - name: 'Claim: a root is found by its backend or cloud block, in any file'
@@ -402,7 +430,7 @@ jobs:
     - name: 'Claim: the pipeline will not run with a mistake in its config file'
       run: test/config/run.sh
 
-    - name: 'Claim: a secret or variable that is not set stops the job, and says which'
+    - name: 'Claim: a variable that is not set stops the job, and says which'
       run: test/export/run.sh
 
     - name: 'Claim: a lock file made on another platform works'
@@ -614,8 +642,8 @@ jobs:
         fi
 
   # Reads the log of one of the pipeline's plan jobs. The self-test's
-  # credentials action prints the environment's key, a secret, and its user,
-  # a variable.
+  # credentials action prints a value it has masked, and the environment's
+  # user, a variable.
   masking:
     name: 'Claims: masking'
     needs: terraform
@@ -639,8 +667,8 @@ jobs:
         log=$(gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs")
         # The control proves that the log shows masking. So the user's value
         # in full means it was not masked.
-        if ! grep -qE 'Z Key: \*\*\*$' <<<"$log"; then
-          echo "::error::The log does not show the secret masked, so it cannot show the variable unmasked."
+        if ! grep -qE 'Z Control: \*\*\*$' <<<"$log"; then
+          echo "::error::The log does not show the control masked, so it cannot show the variable unmasked."
           exit 1
         fi
         if ! grep -qE 'Z User: self-test-plan-user$' <<<"$log"; then
@@ -648,7 +676,7 @@ jobs:
           grep -E 'Z User: ' <<<"$log" || true
           exit 1
         fi
-        echo "The secret is masked, and the variable is not."
+        echo "The control is masked, and the variable is not."
 
   # A branch other than the default branch tries to use the plan environment,
   # from a workflow of its own. The attempt runs on the

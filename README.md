@@ -130,8 +130,10 @@ runners or the actions shows up even when this repository has not changed.
   compared.
 - The settings check can install a private module.
 - A private module's token is not written into Terraform's working files.
+- The App's key can be passed by name, even if only the environments have
+  it.
 - The pipeline will not run with a mistake in its config file.
-- A secret or variable that is not set stops the job, and says which.
+- A variable that is not set stops the job, and says which.
 - A variable's value is not hidden in the logs.
 - A root is found by its backend or cloud block, in any file.
 - A lock file made on another platform works.
@@ -142,7 +144,7 @@ runners or the actions shows up even when this repository has not changed.
 
 The self-test also plans its own fixtures through the pipeline, and applies
 them after a merge. That shows providers still work in the sandbox. It also shows that an
-environment's API key reaches the credentials action only in that
+environment's variables reach the credentials action only in that
 environment's jobs. One fixture uses a module from a private repository. So
 its jobs show that the token from a GitHub App works.
 
@@ -175,8 +177,7 @@ Each principle follows from the one before.
    environment, and GitHub decides which workflows may use it. For providers
    that accept OIDC, GitHub gives the job a signed token that names its
    environment, and the provider checks it. For providers that only take API
-   keys, the key is stored as a secret of the environment. GitHub only gives it
-   to jobs that run in that environment.
+   keys, the key is kept in a secret store that checks the same token.
 
 4. **Everything depends on protecting the default branch.** In this pipeline,
    only workflows on your default branch can use the plan and apply
@@ -304,46 +305,41 @@ Terraform at all. GitHub's hosted Ubuntu runners do support it.
 
 ### API keys are kept out of reach
 
-Some providers do not accept OIDC. For those, you store an API key as a secret
-of each environment. The plan environment gets a key for planning. The apply
-environment gets a key for applying.
+Some providers do not accept OIDC. For those, keep the API key in an outside
+secret store, such as AWS Secrets Manager or Vault. Your credentials action
+signs in to the store with the job's OIDC token, fetches the key, and exports
+it as an environment variable. The provider can read it. Terraform code
+cannot, because of the sandbox.
 
-GitHub only gives an environment's secrets to jobs that run in that
-environment. Only your default branch can use these environments. So a branch
-cannot reach the keys, for the same reason it cannot reach the OIDC tokens.
+The store trusts each environment's OIDC subject, as a provider would. So the
+plan environment's subject can fetch a key for planning, and the apply
+environment's subject a key for applying. Only your default branch can use
+these environments. So a branch cannot reach the keys, for the same reason it
+cannot reach the OIDC tokens.
 
-Your config file names each key, and the environment variable to put it in.
-The pipeline exports it there. The provider can read it. Terraform code
-cannot, because of the sandbox. GitHub hides the key's value if it ever
-appears in a log.
+A few rules follow:
 
-The config cannot put a key in a Terraform variable, such as
-`TF_VAR_api_key`. Terraform code can read any Terraform variable, so the key
-would not be protected.
+- Hide the key in the logs before you export it. GitHub only hides the
+  secrets it stores itself. Many actions that fetch from a store hide what
+  they fetch. Otherwise, use `echo "::add-mask::$KEY"`.
+- Do not put a key in a Terraform variable, such as `TF_VAR_api_key`.
+  Terraform code can read any Terraform variable, so the key would not be
+  protected.
+- Pass credentials as environment variables, not files. The provider cannot
+  read a file outside the sandbox. Terraform code can read a file inside it.
 
-For this to work, the workflow that calls the pipeline must pass
-`secrets: inherit`. Without it, GitHub gives the pipeline no secrets at all,
-not even the environment's. This has a cost. It also passes the pipeline all
-of your repository's and organization's other secrets. The pipeline only
-exports the ones your config names. It hands the rest only to your
-credentials action, if you have one, which comes from your default branch.
-But keep secrets that Terraform does not need out of the repository where
-you can.
-
-Credentials must be passed as environment variables, not files. The provider
-cannot read a file outside the sandbox. Terraform code can read a file inside
-it.
-
-You can also keep keys in an outside secret store, such as Vault or AWS
-Secrets Manager. Your credentials action would sign in to the store with the
-job's OIDC token and fetch the key. This is not needed to keep branches away
-from the keys. Environment secrets already do that, and a store would rely on
-the same environment rules. But a store can add things environment secrets do
-not have:
+A store also gives you things a GitHub secret does not:
 
 - a log of every time a key is fetched
 - one place to rotate a key that many repositories use
 - keys that the store creates for each run and that expire soon after
+
+The pipeline does not export API keys stored as GitHub secrets. A called
+workflow only receives the secrets it names in advance, and your keys' names
+are yours. `secrets: inherit` would pass every secret, without naming them.
+But it only works within one organization or enterprise. It would also hand
+the pipeline every other secret you have. The one secret the pipeline does
+name is the key for [private modules](#private-modules).
 
 ### Only providers you have approved can be installed
 
@@ -426,8 +422,9 @@ approval environment if it is set up safely. It must:
 If it does not, the pipeline ignores it.
 
 Plans in the approval environment need the same credentials as normal plans.
-So give it its own copies of the plan environment's secrets. And make your
-providers trust its OIDC subject, as well as the plan environment's.
+So give it its own copies of the plan environment's variables. And make your
+providers and secret stores trust its OIDC subject, as well as the plan
+environment's.
 
 ### Private modules
 
@@ -437,7 +434,6 @@ creates one from a GitHub App that you name in the config file:
 ```yaml
 private-modules:
   client-id: Iv23liEXAMPLE
-  private-key-secret: MODULES_APP_KEY
 ```
 
 The App belongs to the organization that owns the modules, and is installed
@@ -446,9 +442,22 @@ there:
 - Give the App read access to contents, and nothing else.
 - Install it with "Only select repositories", and select the module
   repositories.
-- Store its private key as a secret, with the name you gave, in each
-  environment that installs modules. That is every environment the config
-  names.
+- Store its private key as a secret named
+  `TERRAFORM_PIPELINE_MODULES_APP_KEY`, in each environment that installs
+  modules. That is every environment the config names.
+- Pass that secret to the pipeline by name, in the workflow that calls it:
+
+  ```yaml
+  secrets:
+    TERRAFORM_PIPELINE_MODULES_APP_KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
+  ```
+
+The App's key can be passed by name, even if only the environments have it.
+Your workflow cannot read an environment's secret, because the job that
+calls the pipeline has no environment. So in your workflow, the key looks
+empty. But GitHub gives each of the pipeline's jobs its own environment's
+copy of a secret that is passed by name. This also works from another
+organization.
 
 Each job creates its own token. The token can only read, and it expires
 after an hour. It covers every repository that the App's installation
@@ -472,7 +481,6 @@ Name the owner in your config:
 private-modules:
   owner: MODULE-ORG
   client-id: Iv23liEXAMPLE
-  private-key-secret: MODULE_ORG_APP_KEY
 ```
 
 The owner should create one App for each organization that consumes its
@@ -500,8 +508,8 @@ Some rules follow from how this works:
   run your credentials action. So a root that uses such a module does not
   pass the check.
 - The same is true of a module from a private Terraform registry. Plans and
-  applies can install it, with a `TF_TOKEN_` variable from
-  `environment-variables`. The settings check cannot yet.
+  applies can install it, with a `TF_TOKEN_` variable that your credentials
+  action exports. The settings check cannot yet.
 
 Hiding this token matters less than hiding the others. Once a module is
 fetched, Terraform code can read all of it and print it. That can include
@@ -576,8 +584,9 @@ can accept these trade-offs:
 
 - **Linux runners only.** The sandbox needs Landlock. GitHub's hosted Ubuntu
   runners have it. macOS and Windows runners do not.
-- **The pipeline receives all your secrets.** The calling workflow must pass
-  `secrets: inherit`, or environment secrets cannot reach the pipeline. See
+- **API keys need a secret store.** A provider that does not accept OIDC
+  needs its key in a store that does, such as AWS Secrets Manager or Vault.
+  The pipeline does not export keys stored as GitHub secrets. See
   [API keys are kept out of reach](#api-keys-are-kept-out-of-reach).
 - **Some pull requests wait.** A pull request that changes a provider setting
   you have not listed as safe is planned only after an approval, or after it
@@ -607,10 +616,9 @@ Read [What it costs](#what-it-costs) and
   Landlock.
 - Branch rules on environments. For a private repository, this needs GitHub
   Pro, Team or Enterprise.
-- Providers that take credentials from OIDC or from environment variables.
-- While this repository is private, a repository in the same organization.
-  This repository's Actions access setting must also allow yours. See
-  [Pinning the pipeline](#pinning-the-pipeline).
+- Providers that take credentials from OIDC, or from environment variables.
+  A key that a provider reads from an environment variable needs a secret
+  store that accepts OIDC.
 
 If your repository is public, also allow `pull_request_target` in its
 workflow event policy. From 2026-11-02, GitHub blocks this trigger by
@@ -666,9 +674,10 @@ tells your code whether it is planning or applying. The environment decides.
   as `repo:ORG@1234/REPO@5678:environment:terraform-plan`. Store anything
   that differs between plan and apply, such as a role's ARN, as a variable
   of each environment.
-- **For a provider that takes an API key,** store the key as a secret of the
-  environment. Give the plan environment a key for planning, and the apply
-  environment a key for applying. Use the same secret name in both. See
+- **For a provider that takes an API key,** store the key in a secret store
+  that trusts the environment's subject. Give the plan environment a key for
+  planning, and the apply environment a key for applying. Your credentials
+  action fetches it. See
   [API keys are kept out of reach](#api-keys-are-kept-out-of-reach).
 
 Give the plan credentials as little access as the provider allows.
@@ -705,11 +714,9 @@ backends:
   s3:
     safe-settings: [key]
 
-# Environment variables to export, by name. Each value comes from a secret,
-# or from a variable of the environment.
+# Environment variables to export, by name. Each value comes from a variable
+# of the environment.
 environment-variables:
-  DD_API_KEY: DATADOG_API_KEY
-  DD_APP_KEY: DATADOG_APP_KEY
   DD_HOST: { variable: DATADOG_HOST }
 ```
 
@@ -723,7 +730,7 @@ These are all the settings:
 | `root-directory` | Where to look for roots. | The whole repository |
 | `shared-paths` | Paths that, when changed, plan every root. `.` is the repository's top directory, so it plans every root on every change. | None |
 | `environments` | The names of the `plan`, `apply`, `modules` and `approval` environments. | `terraform-plan` and `terraform-apply` |
-| `environment-variables` | A map from an environment variable's name to a secret's name, or to `{ variable: NAME }`. | None |
+| `environment-variables` | A map from an environment variable's name to `{ variable: NAME }`. | None |
 | `private-modules` | The GitHub App for [private modules](#private-modules), and the organization that owns the modules. | None. The owner defaults to your organization. |
 | `checkov`, `checkov-config` | Whether to scan with Checkov, and the config for roots that have none of their own. | No scan |
 
@@ -733,14 +740,13 @@ unknown setting, a value of the wrong type, or a value exported as a
 Terraform variable, and it reports every mistake at once. A Terraform
 variable is refused because Terraform code can read it.
 
-When a job starts, every secret and variable that `environment-variables`
-names must be set in its environment. If one is missing, the job stops and
-says which.
+When a job starts, every variable that `environment-variables` names must be
+set in its environment. If one is missing, the job stops and says which.
 
-Use a variable for a value that differs between plan and apply but is not
-secret, such as a user name or an account ID. GitHub hides a secret's value
-everywhere it appears in the logs. So a user name stored as a secret would
-also be hidden in plan output. A variable's value is not hidden.
+Use it for a value that differs between plan and apply but is not secret,
+such as a user name or an account ID. A variable's value is not hidden in the
+logs. A secret cannot be exported here. See
+[API keys are kept out of reach](#api-keys-are-kept-out-of-reach).
 
 ### 6. Write a credentials action, if you need one
 
@@ -748,10 +754,9 @@ You need one only for credentials that the config file cannot export. Most
 often, that is a sign-in through OIDC. Create
 `.github/terraform-pipeline/credentials/action.yml`. The pipeline runs it
 from your default branch, in each plan and apply job, after exporting the
-config's environment variables. It receives three inputs:
+config's environment variables. It receives two inputs:
 
 - `root`: the root's path, if its credentials differ from the others'.
-- `secrets`: the job's secrets as JSON, including the environment's.
 - `vars`: the job's variables as JSON, including the environment's.
 
 For example, AWS through OIDC:
@@ -761,8 +766,6 @@ name: 'Credentials'
 
 inputs:
   root:
-    required: true
-  secrets:
     required: true
   vars:
     required: true
@@ -798,8 +801,9 @@ permissions: {}
 jobs:
   terraform:
     uses: Triple-AIM/terraform-pipeline/.github/workflows/terraform.yml@COMMIT
-    # Without this, environment secrets cannot reach the pipeline.
-    secrets: inherit
+    # Only for private modules. The pipeline takes no other secret.
+    secrets:
+      TERRAFORM_PIPELINE_MODULES_APP_KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
     # A called workflow cannot have more than this. The pipeline needs
     # `actions: read` to check your environments' rules.
     permissions:
@@ -967,10 +971,10 @@ Whichever you choose, a pull request that changes the pipeline's version does
 not run the new version until it is merged. This is because plans always run
 the workflow from your default branch.
 
-If you keep the pipeline in a private repository, other repositories can only
-call it if they are in the same organization. The repository's Actions access
-setting must also allow them to. Repositories in another organization have to
-vendor a copy.
+If you keep a copy of the pipeline in a private repository, other
+repositories can only call it if they are in the same organization. The
+repository's Actions access setting must also allow them to. Repositories in
+another organization have to vendor a copy.
 
 ## Compared with other tools
 
@@ -1130,9 +1134,8 @@ a decision about them.
   careless workflow on your default branch can undo these protections. Keep
   other workflows away from the plan and apply environments.
 - **API keys last a long time.** The pipeline keeps branches from reaching
-  them. It does not help if a key leaks some other way. Rotate them. A secret
-  store can make this easier, as described in
-  [API keys are kept out of reach](#api-keys-are-kept-out-of-reach).
+  them. It does not help if a key leaks some other way. Rotate them. A store
+  that creates keys for each run avoids this.
 - **An apply can break the pipeline's own access.** If that happens, a person
   has to fix it using direct credentials. That is why emergency access is a
   requirement.
@@ -1152,6 +1155,10 @@ a decision about them.
   repository, so they should be planned. But Dependabot has its own rules for
   tokens and secrets. They may stop its plans from getting environment secrets
   or OIDC tokens. This has not been tested.
+- **API keys stored as GitHub secrets.** The pipeline cannot receive a
+  secret it does not name in advance, except through `secrets: inherit`. So
+  today a key without OIDC needs an outside store. A way to pass such keys
+  without `inherit` is still to be chosen.
 - **A setup module.** This repository could include a module that creates the
   state bucket, the OIDC provider, and the plan and apply identities for a new
   user.
@@ -1172,8 +1179,8 @@ actions it loads from this repository:
 - `.github/actions/install-comparison` builds a small Go program. It finds
   the roots, and it is the settings check.
 - `.github/actions/read-config` reads and checks the config file.
-- `.github/actions/export-environment-variables` exports the secrets and
-  variables that the config names.
+- `.github/actions/export-environment-variables` exports the variables that
+  the config names.
 - `.github/actions/module-token` creates the token for private modules, and
   lets git use it.
 - `.github/actions/check-latest` stops a job whose run's commit is no longer

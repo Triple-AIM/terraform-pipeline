@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs the pipeline's export script on sample secrets and variables.
+# Runs the pipeline's export script on sample variables.
 #
 #   run.sh
 #
@@ -15,8 +15,7 @@ trap 'rm -f "$env_file" "$log"' EXIT
 failed=0
 
 export ENVIRONMENT=terraform-plan
-export SECRETS='{"API_KEY": "key-value", "MULTI_LINE": "line one\nline two", "USER_NAME": "a-secret"}'
-export VARS='{"USER_NAME": "user-value"}'
+export VARS='{"USER_NAME": "user-value", "MULTI_LINE": "line one\nline two"}'
 
 # Runs the script with $1 as the config's `environment-variables`. Sets
 # $status to its exit status.
@@ -46,12 +45,11 @@ fail() {
   failed=1
 }
 
-run '{"PROVIDER_KEY": "API_KEY", "PROVIDER_USER": {"variable": "USER_NAME"}, "PROVIDER_PEM": "multi_line"}'
-claim='secrets and variables are exported'
+run '{"PROVIDER_USER": {"variable": "USER_NAME"}, "PROVIDER_LINES": {"variable": "multi_line"}}'
+claim='variables are exported'
 if [ "$status" = 0 ] &&
-  [ "$(loaded PROVIDER_KEY)" = key-value ] &&
   [ "$(loaded PROVIDER_USER)" = user-value ] &&
-  [ "$(loaded PROVIDER_PEM)" = $'line one\nline two' ]; then
+  [ "$(loaded PROVIDER_LINES)" = $'line one\nline two' ]; then
   pass "$claim"
 else
   fail "$claim"
@@ -59,17 +57,11 @@ fi
 claim='the script masks nothing'
 if grep -q '::add-mask::' "$log"; then fail "$claim"; else pass "$claim"; fi
 
-run '{"PROVIDER_USER": {"variable": "API_KEY"}, "PROVIDER_KEY": "NO_SUCH_SECRET", "PROVIDER_OTHER": {"variable": "NO_SUCH_VARIABLE"}}'
-claim='a source that is not set stops the job'
+run '{"PROVIDER_KEY": {"variable": "NO_SUCH_KEY"}, "PROVIDER_OTHER": {"variable": "NO_SUCH_VARIABLE"}}'
+claim='a variable that is not set stops the job'
 if [ "$status" != 0 ]; then pass "$claim"; else fail "$claim"; fi
-claim='a variable is not looked up among the secrets'
-if grep -qF 'The variable API_KEY is not set in the terraform-plan environment. So PROVIDER_USER cannot be set.' "$log"; then
-  pass "$claim"
-else
-  fail "$claim"
-fi
-claim='every source that is not set is named'
-if grep -qF 'The secret NO_SUCH_SECRET is not set' "$log" &&
+claim='every variable that is not set is named'
+if grep -qF 'The variable NO_SUCH_KEY is not set in the terraform-plan environment. So PROVIDER_KEY cannot be set.' "$log" &&
   grep -qF 'The variable NO_SUCH_VARIABLE is not set' "$log"; then
   pass "$claim"
 else
