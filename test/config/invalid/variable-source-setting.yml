@@ -1,0 +1,6 @@
+# expect: `environment-variables.SNOWFLAKE_USER` must be a secret's name, or `{ variable: NAME }`.
+terraform-version: "1.16.1"
+providers:
+  snowflakedb/snowflake:
+environment-variables:
+  SNOWFLAKE_USER: { var: SNOWFLAKE_USER }

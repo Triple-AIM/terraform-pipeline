@@ -1,0 +1,7 @@
+# expect: `private-modules` needs `environments.modules`.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+private-modules:
+  client-id: Iv23liexample
+  private-key-secret: MODULES_APP_KEY

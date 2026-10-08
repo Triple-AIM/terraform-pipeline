@@ -1,0 +1,9 @@
+#!/bin/bash
+# Copies its input to its output, with workflow commands turned off.
+#
+# The branch decides what Terraform prints. Shown through this, none of it
+# is obeyed as a workflow command, such as `::add-mask::`.
+token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+echo "::stop-commands::$token"
+cat "$@"
+echo "::$token::"

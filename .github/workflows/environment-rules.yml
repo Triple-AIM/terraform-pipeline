@@ -1,0 +1,25 @@
+name: 'Environment rules'
+run-name: 'Environment rules: expected to fail (${{ inputs.marker }})'
+
+# A branch's own workflow tries to use the plan environment. GitHub has to
+# turn it away, because the pipeline's protection depends on that. So this run
+# is expected to fail. The self-test starts it on the
+# self-test/environment-rules branch. Then it checks that the run failed for
+# that reason.
+on:
+  workflow_dispatch:
+    inputs:
+      marker:
+        description: 'Lets the self-test that started this run find it.'
+        required: true
+
+permissions: {}
+
+jobs:
+  attempt:
+    name: 'Expected to fail: a branch uses the plan environment'
+    runs-on: ubuntu-latest
+    environment: terraform-plan
+    steps:
+    - name: Reached the plan environment
+      run: 'true'

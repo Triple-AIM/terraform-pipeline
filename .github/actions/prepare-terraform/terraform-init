@@ -1,0 +1,37 @@
+#!/bin/bash
+# Runs `terraform init` in the current directory, with the lock file in
+# charge.
+#
+# The first init cannot change the lock file. It installs only the providers
+# the lock file names, at the versions it names. It checks each download
+# against the lock file's hashes.
+#
+# A lock file made on another platform can still lack one hash for this
+# platform. That hash is of the installed files, not the download. Every
+# command after init checks the installed files against it. So the second
+# init adds it. Its download is checked against the same hashes as the first.
+#
+# Then this checks that the second init added only such hashes. Anything
+# else stops the job.
+set -euo pipefail
+
+lock=.terraform.lock.hcl
+
+terraform init -lockfile=readonly -no-color 2>&1 | inert
+
+# With no providers to install, there is no lock file, and no hash to add.
+[ -f "$lock" ] || exit 0
+
+before=$(mktemp)
+cp "$lock" "$before"
+terraform init -no-color 2>&1 | inert
+
+# What diff prints for added lines alone: a position like `7a8`, then each
+# added line.
+added='^[0-9]+a[0-9]+(,[0-9]+)?$|^> +"h1:[A-Za-z0-9+/]{43}=",$'
+changes=$(diff "$before" "$lock" || true)
+if [ -n "$changes" ] && grep -Eqv "$added" <<<"$changes"; then
+  echo "::error::terraform init changed the lock file in more ways than adding this platform's hashes."
+  inert <<<"$changes"
+  exit 1
+fi

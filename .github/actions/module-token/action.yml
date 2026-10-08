@@ -1,0 +1,57 @@
+name: 'Module token'
+description: >-
+  Creates a token from a GitHub App, and lets git use it to fetch modules
+  from GitHub. The token can only read, and only the owner's repositories
+  that the App is installed on.
+
+inputs:
+  owner:
+    description: 'The organization the App is installed on, which owns the modules.'
+    required: true
+  client-id:
+    description: "The App's client ID."
+    required: true
+  private-key:
+    description: "The App's private key."
+    required: true
+  private-key-secret:
+    description: 'The name of the secret that holds the private key. Used in messages.'
+    required: true
+  environment:
+    description: "The job's environment. Used in messages."
+    required: true
+
+runs:
+  using: composite
+  steps:
+  - name: Check the private key
+    shell: bash
+    env:
+      KEY: ${{ inputs.private-key }}
+      SECRET: ${{ inputs.private-key-secret }}
+      ENVIRONMENT: ${{ inputs.environment }}
+    run: |
+      if [ -z "$KEY" ]; then
+        echo "::error::The secret $SECRET is not set in the $ENVIRONMENT environment. It is needed to fetch private modules."
+        exit 1
+      fi
+
+  # Without `repositories`, the token covers every repository of the owner
+  # that the App is installed on. So the App's installation is the only list.
+  # The App may belong to another organization than the caller's. Only its
+  # private key is needed here.
+  - name: Create the token
+    id: token
+    uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+    with:
+      client-id: ${{ inputs.client-id }}
+      private-key: ${{ inputs.private-key }}
+      owner: ${{ inputs.owner }} # zizmor: ignore[github-app] the installation selects the repositories, so it is the only list
+      permission-contents: read
+
+  - name: Let git use the token
+    shell: bash
+    env:
+      TOKEN: ${{ steps.token.outputs.token }}
+      OWNER: ${{ inputs.owner }}
+    run: '"$GITHUB_ACTION_PATH/git-header.sh"'

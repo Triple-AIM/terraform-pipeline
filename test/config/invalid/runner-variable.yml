@@ -1,0 +1,6 @@
+# expect: `GITHUB_OUTPUT` is set by the runner
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+environment-variables:
+  GITHUB_OUTPUT: OUTPUT

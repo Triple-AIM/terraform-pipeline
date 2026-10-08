@@ -1,0 +1,5 @@
+# expect: `provider` is not a setting.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+provider: hashicorp/aws

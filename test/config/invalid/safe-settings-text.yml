@@ -1,0 +1,5 @@
+# expect: `providers.hashicorp/aws.safe-settings` must be a list of settings.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/aws:
+    safe-settings: region default_tags

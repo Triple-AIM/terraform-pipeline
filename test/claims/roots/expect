@@ -1,0 +1,5 @@
+test/claims/roots/backend-file
+test/claims/roots/cloud
+test/claims/roots/json
+test/claims/roots/json-list
+test/claims/roots/other-file

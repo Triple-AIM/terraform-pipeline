@@ -1,0 +1,56 @@
+#!/bin/bash
+# Prints one hash of every module that Terraform installed into a data
+# directory. Two installs of the same modules give the same hash. So do two
+# roots with no modules, whether or not Terraform made a modules directory.
+#
+#   module-hash DATA_DIR
+#
+# The hash covers each file's path, whether it can be run, and its contents,
+# and where each link points. Two things are left out, because they differ
+# between two installs of the same code, and Terraform does not load them as
+# configuration:
+#
+# - the manifest, which names each module's directory by its full path
+# - git's own files, in modules installed with git
+#
+# A module can still be installed under a path named `.git`, for example from
+# an archive. Then the hash would leave out its code. So a module directory
+# with `.git` in its path, or a Terraform file under `.git`, stops this with
+# an error instead.
+set -euo pipefail
+
+modules="$1/modules"
+if [ -f "$modules/modules.json" ]; then
+  # jq -e exits 0 if some directory has .git in its path, 1 if none has, and
+  # anything else if the manifest cannot be read.
+  status=0
+  jq -e '[.Modules[].Dir | split("/") | index(".git")] | any' "$modules/modules.json" > /dev/null || status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "::error::A module is installed under a path named .git, which the module check cannot cover." >&2
+    exit 1
+  elif [ "$status" -ne 1 ]; then
+    echo "::error::The module manifest could not be read." >&2
+    exit 1
+  fi
+fi
+if [ -d "$modules" ] &&
+  [ -n "$(find "$modules" -path '*/.git/*' \( -name '*.tf' -o -name '*.tf.json' \) -print -quit)" ]; then
+  echo "::error::A Terraform file is under a path named .git, which the module check cannot cover." >&2
+  exit 1
+fi
+{
+  if [ -d "$modules" ]; then
+    cd "$modules"
+    find . -path ./modules.json -prune -o -name .git -prune -o \( -type f -o -type l \) -print0 |
+      sort -z |
+      while IFS= read -r -d '' path; do
+        if [ -L "$path" ]; then
+          printf 'link %s %s\0' "$path" "$(readlink "$path")"
+        else
+          mode=-
+          [ ! -x "$path" ] || mode=x
+          printf 'file %s %s %s\0' "$path" "$mode" "$(sha256sum < "$path" | cut -d' ' -f1)"
+        fi
+      done
+  fi
+} | sha256sum | cut -d' ' -f1

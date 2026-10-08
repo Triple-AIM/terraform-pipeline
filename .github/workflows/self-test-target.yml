@@ -1,0 +1,32 @@
+name: 'Self-test as a consumer'
+
+# Runs the pipeline the way a consumer would:
+#
+# - from `pull_request_target`
+# - with plan and apply environments that only the default branch may use
+# - with none of the self-test's exceptions
+#
+# GitHub takes this workflow, and the pipeline it calls, from the default
+# branch. So a pull request here is planned by the pipeline already merged,
+# not by the version the pull request proposes.
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] the trigger under test
+    branches: [ "main" ]
+
+concurrency:
+  group: self-test-consumer/${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  terraform:
+    uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the default branch's copy, as a pinned consumer would have
+    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      config-file: test/config/consumer.yml

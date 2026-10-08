@@ -1,0 +1,32 @@
+name: 'Prepare Terraform'
+description: >-
+  Installs Terraform. Then puts four commands first on the PATH. `terraform`
+  runs Terraform in a Landlock sandbox, and installs only the listed
+  providers. `terraform-init` initializes a root from its lock file.
+  `module-hash` prints a hash of the modules Terraform installed. `inert`
+  shows its input with workflow commands turned off.
+
+inputs:
+  terraform-version:
+    description: 'The Terraform version to install.'
+    required: true
+  providers:
+    description: 'The providers Terraform may install, one per line.'
+    required: true
+
+runs:
+  using: composite
+  steps:
+  - name: Setup Terraform
+    uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+    with:
+      terraform_version: ${{ inputs.terraform-version }}
+      # Nothing reads the wrapper's step outputs. Output is saved to files
+      # instead.
+      terraform_wrapper: false
+
+  - name: Sandbox Terraform
+    shell: bash
+    env:
+      PROVIDERS: ${{ inputs.providers }}
+    run: '"$GITHUB_ACTION_PATH/prepare.sh"'

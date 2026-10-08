@@ -1,0 +1,3 @@
+# Nothing in the fixtures is real infrastructure. So this file only has to
+# exist.
+soft-fail: false

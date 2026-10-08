@@ -1,0 +1,1047 @@
+name: 'Terraform'
+
+# Plans pull requests and applies the default branch. Call it from a workflow
+# that runs on these events:
+#
+# - `pull_request_target`
+# - `push` to the default branch
+# - `workflow_dispatch`, if you want to plan and apply by hand
+#
+# Its settings come from a config file, not from inputs. So they can be lists
+# and maps, and a mistake in them stops the run.
+#
+# Two directories are checked out side by side:
+#
+# - `trusted` is the commit the run belongs to. Under `pull_request_target`,
+#   that is the default branch. It supplies the config file and the
+#   credentials action.
+# - `code` is the commit being planned. Nothing in it runs except Terraform,
+#   and Terraform only runs in a sandbox.
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: >-
+          The config file, relative to the repository. It is always read from
+          the commit the run belongs to, never from a pull request.
+        type: string
+        default: '.github/terraform-pipeline/config.yml'
+      terraform-version:
+        description: >-
+          Used instead of the config file's Terraform version, if set. For
+          trying a new version, such as `latest`.
+        type: string
+        default: ''
+      allow-unprotected-environments:
+        description: >-
+          Only for testing this pipeline. It allows runs under `pull_request`,
+          and environments that any branch may use. Either one gives a branch
+          the plan credentials.
+        type: boolean
+        default: false
+
+permissions: {}
+
+defaults:
+  run:
+    # Named explicitly. Only an explicit `bash` adds `-e -o pipefail`.
+    shell: bash
+
+# A run waits while another run in its group is running. So two merges never
+# apply at once. If a newer run arrives while one waits, the waiting run is
+# cancelled, and the newer run does its work.
+#
+# Each pull request has its own group. So does each branch, which is what a
+# push to the default branch uses. Under `pull_request_target`, every pull
+# request has the default branch's ref, so its number is used instead.
+#
+# The group also names the calling workflow and the config file. So two
+# callers never wait for each other, or cancel each other's waiting runs. Its
+# prefix keeps it apart from any group the caller sets itself. A called
+# workflow in the same group as its caller would wait for itself.
+concurrency:
+  group: >-
+    terraform-pipeline/${{ github.workflow }}/${{ inputs.config-file }}/${{
+    github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CHECKOV_IMAGE: 'bridgecrew/checkov:3.3.20@sha256:6d20ebbcde58b2dce6e3151a6771fefa4d468281fe442475455623f5799b9f53'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # Reads the config, and checks the environments it names. Every other job
+  # needs this one, and none of them starts if it fails. Its only credential
+  # is an OIDC token with no environment, which it reads and never sends.
+  config:
+    name: 'Config'
+    # Pull requests from forks get nothing. No runner starts, no token is
+    # issued, and nothing is checked out. GitHub evaluates this before the job
+    # starts. It comes from the default branch's workflow file, so a fork
+    # cannot remove it.
+    if: >-
+      !github.event.pull_request ||
+      github.event.pull_request.head.repo.id == github.event.repository.id
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      # To show the OIDC subjects.
+      id-token: write
+    outputs:
+      terraform-version: ${{ steps.config.outputs.terraform-version }}
+      providers: ${{ steps.config.outputs.providers }}
+      safe-settings: ${{ steps.config.outputs.safe-settings }}
+      root-directory: ${{ steps.config.outputs.root-directory }}
+      shared-paths: ${{ steps.config.outputs.shared-paths }}
+      plan-environment: ${{ steps.config.outputs.plan-environment }}
+      apply-environment: ${{ steps.config.outputs.apply-environment }}
+      modules-environment: ${{ steps.config.outputs.modules-environment }}
+      environment-variables: ${{ steps.config.outputs.environment-variables }}
+      private-modules: ${{ steps.config.outputs.private-modules }}
+      checkov: ${{ steps.config.outputs.checkov }}
+      checkov-config: ${{ steps.config.outputs.checkov-config }}
+      approval: ${{ steps.environments.outputs.approval }}
+      approval-problem: ${{ steps.environments.outputs.approval-problem }}
+
+    steps:
+    - name: Checkout the default branch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.sha }}
+        path: trusted
+        persist-credentials: false
+
+    - name: Read the config
+      id: config
+      uses: $/.github/actions/read-config
+      with:
+        file: ${{ inputs.config-file }}
+        checkout: trusted
+        terraform-version: ${{ inputs.terraform-version }}
+
+    # Everything else depends on these checks. Either of these would give a
+    # branch the credentials, so either one ends the run here:
+    #
+    # - a plan, apply or modules environment that any branch may use
+    # - a run under `pull_request`, where the branch controls the workflow
+    #
+    # An approval environment that is not safe is not used.
+    - name: Check the environments
+      id: environments
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: ${{ github.event_name }}
+        PULL_REQUEST: ${{ github.event.pull_request.number }}
+        PLAN_ENVIRONMENT: ${{ steps.config.outputs.plan-environment }}
+        APPROVAL_ENVIRONMENT: ${{ steps.config.outputs.approval-environment }}
+        APPLY_ENVIRONMENT: ${{ steps.config.outputs.apply-environment }}
+        MODULES_ENVIRONMENT: ${{ steps.config.outputs.modules-environment }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: ${{ inputs.allow-unprotected-environments }}
+      run: |
+        # Prints why the environment cannot be used. Prints nothing if it can.
+        unusable() {
+          local name=$1 reviewed=$2 env policies
+          grep -Eq '^[A-Za-z0-9._-]+$' <<<"$name" || { echo "its name is not usable."; return; }
+          env=$(gh api "repos/$GITHUB_REPOSITORY/environments/$name" 2>/dev/null) ||
+            { echo "it could not be read. It may not exist yet."; return; }
+          if [ "$reviewed" = true ]; then
+            jq -e '[.protection_rules[]? | select(.type == "required_reviewers" and (.reviewers | length) > 0)] | length > 0' <<<"$env" > /dev/null ||
+              { echo "it does not require a reviewer."; return; }
+            jq -e '[.protection_rules[]? | select(.type == "required_reviewers" and .prevent_self_review == true)] | length > 0' <<<"$env" > /dev/null ||
+              { echo "it does not prevent self-review."; return; }
+          fi
+          jq -e '.deployment_branch_policy.custom_branch_policies == true' <<<"$env" > /dev/null ||
+            { echo "it is not restricted to named branches."; return; }
+          policies=$(gh api "repos/$GITHUB_REPOSITORY/environments/$name/deployment-branch-policies" \
+            --jq '[.branch_policies[] | "\(.type // "branch"):\(.name)"]' 2>/dev/null) ||
+            { echo "its branch policies could not be read."; return; }
+          jq -e --arg want "branch:$DEFAULT_BRANCH" '. == [$want]' <<<"$policies" > /dev/null ||
+            { echo "it allows more than the default branch."; return; }
+        }
+
+        if [ "$ALLOW_UNPROTECTED" = true ]; then
+          echo "::warning::Environments are not checked, and \`pull_request\` is allowed. This is only safe for testing the pipeline."
+        else
+          if [ "$EVENT" = pull_request ]; then
+            echo "::error::Under \`pull_request\`, the branch controls the workflow. Call the pipeline from \`pull_request_target\` instead."
+            exit 1
+          fi
+          for name in "$PLAN_ENVIRONMENT" "$APPLY_ENVIRONMENT" "$MODULES_ENVIRONMENT"; do
+            [ -n "$name" ] || continue
+            problem=$(unusable "$name" false)
+            if [ -n "$problem" ]; then
+              echo "::error::The environment \`$name\` cannot be used: $problem Allow only the default branch to use it."
+              exit 1
+            fi
+          done
+        fi
+
+        if [ -n "$PULL_REQUEST" ] && [ -n "$APPROVAL_ENVIRONMENT" ]; then
+          problem=$(unusable "$APPROVAL_ENVIRONMENT" true)
+          if [ -n "$problem" ]; then
+            echo "::warning::Not using the approval environment \`$APPROVAL_ENVIRONMENT\`: $problem"
+            echo "approval-problem=$problem" >> "$GITHUB_OUTPUT"
+          else
+            echo "approval=$APPROVAL_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
+    # Shows the OIDC subject that each environment's jobs will have, so that
+    # providers can be told exactly what to trust. The form depends on the
+    # repository's settings. This job's own token has the same form, so its
+    # subject shows which one is in use. The token is only read.
+    - name: Show the OIDC subjects
+      env:
+        PLAN_ENVIRONMENT: ${{ steps.config.outputs.plan-environment }}
+        APPLY_ENVIRONMENT: ${{ steps.config.outputs.apply-environment }}
+        MODULES_ENVIRONMENT: ${{ steps.config.outputs.modules-environment }}
+        APPROVAL_ENVIRONMENT: ${{ steps.config.outputs.approval-environment }}
+      run: |
+        token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+        echo "::add-mask::$token"
+        payload=$(cut -d. -f2 <<<"$token" | tr '_-' '/+')
+        while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="$payload="; done
+        subject=$(base64 -d <<<"$payload" | jq -r .sub)
+
+        # GitHub's default form names the repository, then the event. With
+        # immutable subjects, the repository part also has numeric IDs.
+        if [[ ! "$subject" =~ ^(repo:[^:]+):(pull_request|ref:.+)$ ]]; then
+          echo "This job's OIDC subject is \`$subject\`. That is not GitHub's default form, so a custom form is in use. Each environment's subject follows it." | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        repository=${BASH_REMATCH[1]}
+        {
+          echo "### OIDC subjects"
+          echo
+          echo "Providers that use OIDC should trust these subjects."
+          echo
+          echo "| Environment | Subject |"
+          echo "|---|---|"
+          for name in "$PLAN_ENVIRONMENT" "$APPLY_ENVIRONMENT" "$MODULES_ENVIRONMENT" "$APPROVAL_ENVIRONMENT"; do
+            if [ -n "$name" ]; then
+              echo "| \`$name\` | \`$repository:environment:$name\` |"
+            fi
+          done
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Finds the roots to plan. A root is a directory with a backend, so roots are
+  # found rather than listed. A change plans the roots it touches. A change to
+  # a shared path, or to a workflow, plans every root.
+  #
+  # For a pull request, this job also compares each root's provider and
+  # backend settings with the default branch. It does that here because this
+  # job holds no plan or apply credentials. It can only hold what the modules
+  # environment gives it, which is meant for reading modules.
+  roots:
+    name: 'Roots'
+    needs: config
+    runs-on: ubuntu-latest
+    # Only a pull request runs the settings check. An empty name means no
+    # environment.
+    environment: ${{ github.event.pull_request && needs.config.outputs.modules-environment || '' }}
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      plan: ${{ steps.compare.outputs.plan }}
+      deferred: ${{ steps.compare.outputs.deferred }}
+      modules: ${{ steps.compare.outputs.modules }}
+
+    steps:
+    - name: Check the commit is the latest
+      uses: $/.github/actions/check-latest
+
+    - name: Checkout the code to plan
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        path: code
+        persist-credentials: false
+
+    - name: Checkout the default branch
+      if: github.event.pull_request
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.sha }}
+        path: trusted
+        persist-credentials: false
+
+    # The same tool finds the roots, and compares their settings.
+    - name: Install the comparison
+      uses: $/.github/actions/install-comparison
+
+    - name: Pick the roots this change touches
+      id: pick
+      working-directory: code
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PULL_REQUEST: ${{ github.event.pull_request.number }}
+        ROOT_DIRECTORY: ${{ needs.config.outputs.root-directory }}
+        SHARED_PATHS: ${{ needs.config.outputs.shared-paths }}
+      run: |
+        # A root is a directory with a backend or cloud block. The tool fails
+        # if a file cannot be read, rather than miss a root.
+        all=$(CODE="$PWD" "$RUNNER_TEMP/terraform-tools/compare/compare" roots | jq -r '.[]')
+
+        # These paths come from the branch, and every later job uses them. So
+        # they may only use characters that cannot mean anything but a path.
+        # The repository's top directory is `.`.
+        while read -r root; do
+          [ -n "$root" ] || continue
+          if [ "$root" = . ]; then
+            continue
+          fi
+          if ! grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._/-]*$' <<<"$root" || [[ "$root" == *..* ]]; then
+            echo "::error::Root path is not usable: $root"
+            exit 1
+          fi
+        done <<<"$all"
+
+        # Whether any changed path starts with the given prefix.
+        touches() {
+          while read -r path; do
+            [[ "$path" == "$1"* ]] && return 0
+          done <<<"$changed"
+          return 1
+        }
+
+        # The default branch plans every root, not only the ones its commit
+        # changed. A run that is waiting behind another is cancelled when a
+        # newer one arrives. The newer run then has to apply its changes too.
+        # Planning a root that did not change only costs a refresh. Skipping
+        # one that did change would leave that change unapplied.
+        every=true
+        if [ -n "$PULL_REQUEST" ]; then
+          # The files API stops at 3000 files. A list cut short would look
+          # complete, so a larger pull request plans every root.
+          count=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST" --jq .changed_files)
+          if [ "$count" -lt 3000 ]; then
+            every=false
+            changed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST/files" --jq '.[].filename, (.[].previous_filename // empty)')
+          fi
+        fi
+
+        # A shared path of `.` is the top directory. It holds every file, so
+        # any change touches it.
+        if [ "$every" = false ]; then
+          while read -r prefix; do
+            if [ "$prefix" = . ] || { [ -n "$prefix" ] && touches "$prefix"; }; then
+              every=true
+            fi
+          done <<<"$(printf '.github/\n%s\n' "$SHARED_PATHS")"
+        fi
+
+        # The top directory holds every file, so any change touches it.
+        picked=$(while read -r root; do
+          [ -n "$root" ] || continue
+          prefix="$root/"
+          [ "$root" != . ] || prefix=""
+          if [ "$every" = true ] || touches "$prefix"; then
+            echo "$root"
+          fi
+        done <<<"$all")
+
+        json=$(jq -Rc 'select(length > 0)' <<<"$picked" | jq -sc .)
+        echo "roots=$json" >> "$GITHUB_OUTPUT"
+        echo "all=$(jq -Rc 'select(length > 0)' <<<"$all" | jq -sc .)" >> "$GITHUB_OUTPUT"
+        echo "Picked: $json"
+
+    # After this, `terraform` runs Terraform in a Landlock sandbox. It only
+    # installs the listed providers. The action is loaded through `$/`, so it
+    # comes from this repository, at the same commit as this workflow.
+    - name: Prepare Terraform
+      uses: $/.github/actions/prepare-terraform
+      with:
+        terraform-version: ${{ needs.config.outputs.terraform-version }}
+        providers: ${{ needs.config.outputs.providers }}
+
+    # The settings check installs every root's modules, so it needs the token
+    # too.
+    - name: Let git fetch private modules
+      if: github.event.pull_request && needs.config.outputs.private-modules
+      uses: $/.github/actions/module-token
+      with:
+        owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
+        client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
+        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
+        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        environment: ${{ needs.config.outputs.modules-environment }}
+
+    - name: Compare with the default branch
+      id: compare
+      env:
+        ALL: ${{ steps.pick.outputs.all }}
+        PICKED: ${{ steps.pick.outputs.roots }}
+        PULL_REQUEST: ${{ github.event.pull_request.number }}
+        PLAN_ENVIRONMENT: ${{ needs.config.outputs.plan-environment }}
+        APPROVAL_ENVIRONMENT: ${{ needs.config.outputs.approval }}
+        SAFE_SETTINGS: ${{ needs.config.outputs.safe-settings }}
+        ROOT_DIRECTORY: ${{ needs.config.outputs.root-directory }}
+      run: |
+        # A root's slug names its comment and its saved plan. Two roots with
+        # the same slug would overwrite each other's, even in separate runs.
+        # So any two roots with the same slug stop the run.
+        clash=$(jq -r '[.[] | gsub("/"; "-")] | group_by(.) | map(select(length > 1) | .[0]) | join(", ")' <<<"$ALL")
+        if [ -n "$clash" ]; then
+          echo "::error::Some roots get the same name when each / in their path becomes -: $clash. Rename one of them."
+          exit 1
+        fi
+
+        report="$RUNNER_TEMP/compare.json"
+        if [ -n "$PULL_REQUEST" ]; then
+          TRUSTED="$GITHUB_WORKSPACE/trusted" CODE="$GITHUB_WORKSPACE/code" \
+          DATA="$RUNNER_TEMP/terraform/compare" OUT="$report" ROOTS="$PICKED" \
+            "$RUNNER_TEMP/terraform-tools/compare/compare" 2>&1 | inert
+        else
+          # The default branch is not compared with itself. Every root passes.
+          jq -n --argjson picked "$PICKED" '[$picked[] | {(.): []}] | add // {}' > "$report"
+        fi
+
+        # Each root goes one of three ways:
+        #
+        # - If its settings pass, it is planned in the plan environment.
+        # - If not, and there is an approval environment, it is planned there.
+        # - Otherwise, it is not planned until it is merged.
+        # A root that the report leaves out has not passed.
+        plan=$(jq -c --argjson picked "$PICKED" --arg planenv "$PLAN_ENVIRONMENT" --arg approval "$APPROVAL_ENVIRONMENT" '
+          . as $report | [$picked[] | . as $p
+            | (if $report | has($p) then $report[$p] else ["The settings check did not report on this root."] end) as $problems
+            | select(($problems | length) == 0 or $approval != "")
+            | {path: $p, slug: ($p | gsub("/"; "-")), problems: $problems,
+               environment: (if ($problems | length) == 0 then $planenv else $approval end)}]' "$report")
+        deferred=$(jq -c --argjson picked "$PICKED" --arg approval "$APPROVAL_ENVIRONMENT" '
+          . as $report | [$picked[] | . as $p
+            | (if $report | has($p) then $report[$p] else ["The settings check did not report on this root."] end) as $problems
+            | select(($problems | length) > 0 and $approval == "")
+            | {path: $p, slug: ($p | gsub("/"; "-")), problems: $problems}]' "$report")
+        echo "plan=$plan" >> "$GITHUB_OUTPUT"
+        echo "deferred=$deferred" >> "$GITHUB_OUTPUT"
+        echo "Planning: $plan"
+        echo "Not planning yet: $deferred"
+
+        # A hash of each root's modules, as the settings check installed
+        # them. The plan job installs them again, and checks they are the
+        # same. The settings check used one data directory for each root, in
+        # the order of the list.
+        modules='{}'
+        if [ -n "$PULL_REQUEST" ]; then
+          i=0
+          while read -r root; do
+            [ -n "$root" ] || continue
+            hash=$(module-hash "$RUNNER_TEMP/terraform/compare/code/$i")
+            modules=$(jq -c --arg r "$root" --arg h "$hash" '. + {($r): $h}' <<<"$modules")
+            i=$((i + 1))
+          done <<<"$(jq -r '.[]' <<<"$PICKED")"
+        fi
+        echo "modules=$modules" >> "$GITHUB_OUTPUT"
+
+  plan:
+    name: 'Plan'
+    needs: [config, roots]
+    if: needs.roots.outputs.plan != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.root.environment }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJSON(needs.roots.outputs.plan) }}
+
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    env:
+      ROOT: ${{ matrix.root.path }}
+      PULL_REQUEST: ${{ github.event.pull_request.number }}
+
+    steps:
+    - name: Check the commit is the latest
+      uses: $/.github/actions/check-latest
+
+    - name: Checkout the default branch
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.sha }}
+        path: trusted
+        persist-credentials: false
+
+    - name: Checkout the code to plan
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        path: code
+        persist-credentials: false
+
+    - name: Prepare Terraform
+      uses: $/.github/actions/prepare-terraform
+      with:
+        terraform-version: ${{ needs.config.outputs.terraform-version }}
+        providers: ${{ needs.config.outputs.providers }}
+
+    - name: Terraform Format
+      id: fmt
+      working-directory: code/${{ matrix.root.path }}
+      run: terraform fmt -check -recursive 2>&1 | inert
+      continue-on-error: true
+
+    # The secrets and variables that the config names, exported as
+    # environment variables. The sandbox keeps Terraform code from reading its
+    # environment. The providers can read it.
+    - name: Export environment variables
+      uses: $/.github/actions/export-environment-variables
+      with:
+        variables: ${{ needs.config.outputs.environment-variables }}
+        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
+        vars: ${{ toJSON(vars) }}
+        environment: ${{ matrix.root.environment }}
+
+    # The caller's credentials action, from the default branch, if it has one.
+    # Its path is fixed, because `uses` cannot take an expression.
+    #
+    # It receives the root, and the job's secrets and variables, including the
+    # environment's. The environment decides which credentials these are. A
+    # composite action cannot read `secrets` itself, and this workflow cannot
+    # know their names.
+    #
+    # It must export what it gives as environment variables. A file would not
+    # work. The sandbox keeps Terraform, and so the providers, out of the home
+    # directory and the runner's temporary files.
+    - name: Get credentials
+      if: hashFiles('trusted/.github/terraform-pipeline/credentials/action.yml', 'trusted/.github/terraform-pipeline/credentials/action.yaml') != ''
+      uses: ./trusted/.github/terraform-pipeline/credentials # zizmor: ignore[self-repository] the caller's action, not this repository's
+      with:
+        root: ${{ matrix.root.path }}
+        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
+        vars: ${{ toJSON(vars) }}
+
+    - name: Let git fetch private modules
+      if: needs.config.outputs.private-modules
+      uses: $/.github/actions/module-token
+      with:
+        owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
+        client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
+        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
+        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        environment: ${{ matrix.root.environment }}
+
+    - name: Terraform Init
+      id: init
+      working-directory: code/${{ matrix.root.path }}
+      run: terraform-init
+      continue-on-error: true
+
+    # The settings check compared the modules that the Roots job installed.
+    # Init installed them again here. A module whose source can change, such
+    # as a git tag, may now be different code. So the plan runs only if they
+    # are the same. A root not in the record has not been compared.
+    - name: Check the modules are the ones compared
+      id: modules
+      if: github.event.pull_request
+      env:
+        MODULES: ${{ needs.roots.outputs.modules }}
+      run: |
+        want=$(jq -r --arg r "$ROOT" '.[$r] // empty' <<<"$MODULES")
+        got=$(module-hash "$TF_DATA_DIR")
+        if [ -z "$want" ]; then
+          echo "::error::The settings check left no record of this root's modules, so they cannot be checked."
+          exit 1
+        fi
+        if [ "$got" != "$want" ]; then
+          echo "::error::This root's modules changed after the settings check compared them. A module's source may have moved, such as a git tag. Push to the pull request to compare them again."
+          exit 1
+        fi
+        echo "The modules are the ones the settings check compared."
+      continue-on-error: true
+
+    # Neither runs after a failed init or module check. Init may have
+    # installed something its checks refused.
+    - name: Terraform Validate
+      id: validate
+      if: steps.init.outcome == 'success' && steps.modules.outcome != 'failure'
+      working-directory: code/${{ matrix.root.path }}
+      run: terraform validate -no-color 2>&1 | tee "$RUNNER_TEMP/validate.txt" | inert
+      continue-on-error: true
+
+    - name: Terraform Plan
+      id: plan
+      if: steps.init.outcome == 'success' && steps.modules.outcome != 'failure'
+      working-directory: code/${{ matrix.root.path }}
+      run: terraform plan -no-color -out=tfplan 2>&1 | tee "$RUNNER_TEMP/plan.txt" | inert
+      continue-on-error: true
+
+    # Scans both the configuration and the plan, because each catches things
+    # the other misses. Some checks follow references between resources. A
+    # plan has already turned those references into values, so only the
+    # configuration still has them. In turn, only the plan has modules and
+    # computed values filled in.
+    #
+    # Checkov runs in a container. It gets the code, the plan and its config,
+    # and nothing else: no network, and none of the job's environment. So it
+    # is also told not to download its guidelines.
+    #
+    # Checkov also reads a config file from the directory it runs in, and
+    # from each directory it scans. So it runs in the scan directory, which
+    # the code being planned cannot reach. And the trusted config is mounted
+    # over any config file in the root it scans.
+    - name: Scan against policy
+      id: scan
+      if: needs.config.outputs.checkov == 'true'
+      continue-on-error: true
+      env:
+        CHECKOV_CONFIG: ${{ needs.config.outputs.checkov-config }}
+        PLAN: ${{ steps.plan.outcome }}
+      run: |
+        config="$ROOT/.checkov.yml"
+        [ -f "trusted/$config" ] || config="$CHECKOV_CONFIG"
+        if [ -z "$config" ] || [ ! -f "trusted/$config" ]; then
+          echo "::error::No Checkov config for $ROOT"
+          exit 1
+        fi
+
+        mkdir -p "$RUNNER_TEMP/scan"
+        docker pull --quiet "$CHECKOV_IMAGE" > /dev/null
+        if [ "$PLAN" = success ]; then
+          terraform -chdir="code/$ROOT" show -json tfplan > "$RUNNER_TEMP/scan/tfplan.json"
+        fi
+
+        # A link or a directory there would move the mount somewhere else.
+        shadow=()
+        for name in .checkov.yml .checkov.yaml; do
+          if [ -L "code/$ROOT/$name" ] || { [ -e "code/$ROOT/$name" ] && [ ! -f "code/$ROOT/$name" ]; }; then
+            echo "::error::code/$ROOT/$name is not a plain file, so the trusted config cannot replace it."
+            exit 1
+          fi
+          if [ -e "code/$ROOT/$name" ]; then
+            shadow+=(-v "$GITHUB_WORKSPACE/trusted/$config:/repo/$ROOT/$name:ro")
+          fi
+        done
+
+        checkov() {
+          # A file Checkov cannot parse fails the scan, rather than being
+          # skipped.
+          docker run --rm --network none \
+            -e CKV_PARSE_ERROR_FAIL=true \
+            -v "$GITHUB_WORKSPACE/code:/repo:ro" \
+            "${shadow[@]}" \
+            -v "$GITHUB_WORKSPACE/trusted/$config:/checkov.yml:ro" \
+            -v "$RUNNER_TEMP/scan:/scan:ro" \
+            -w /scan \
+            --entrypoint checkov \
+            "$CHECKOV_IMAGE" --compact --quiet --skip-download --config-file /checkov.yml "$@"
+        }
+
+        status=0
+        out="$RUNNER_TEMP/checkov.txt"
+        {
+          echo '--- configuration ---'
+          checkov --framework terraform -d "/repo/$ROOT" || status=1
+          if [ -f "$RUNNER_TEMP/scan/tfplan.json" ]; then
+            echo
+            echo '--- plan ---'
+            # A plan is JSON, so it has no comments. Inline skips in the
+            # configuration only reach it through the source directory.
+            checkov --framework terraform_plan \
+              --repo-root-for-plan-enrichment "/repo/$ROOT" \
+              -f /scan/tfplan.json || status=1
+          fi
+        } > "$out" 2>&1
+        rm -f "$RUNNER_TEMP/scan/tfplan.json"
+        inert "$out"
+        exit $status
+
+    - name: Comment on the pull request
+      if: env.PULL_REQUEST
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        SLUG: ${{ matrix.root.slug }}
+        ENVIRONMENT: ${{ matrix.root.environment }}
+        PROBLEMS: ${{ toJSON(matrix.root.problems) }}
+        FMT: ${{ steps.fmt.outcome }}
+        INIT: ${{ steps.init.outcome }}
+        VALIDATE: ${{ steps.validate.outcome }}
+        PLAN: ${{ steps.plan.outcome }}
+        SCAN: ${{ steps.scan.outcome }}
+      with:
+        script: |
+          // Output is read from disk, not passed in the environment. One
+          // environment variable can hold at most 128KB. A plan can be bigger
+          // than that, and then the process fails to start at all.
+          //
+          // A comment can hold at most 65536 characters. So each output is
+          // trimmed to fit, and the comment links to the run log for the rest.
+          const fs = require('fs')
+          const env = process.env
+          const read = name => {
+            const path = `${env.RUNNER_TEMP}/${name}.txt`
+            return fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : ''
+          }
+          const COMMENT_LIMIT = 65536
+          const PLAN_BUDGET = 32000
+          const SCAN_BUDGET = 12000
+          const VALIDATE_BUDGET = 3000
+          const ACTION_BUDGET = 8000
+
+          const trim = (text, budget) => {
+            if (!text) return { body: '(no output)', trimmed: false }
+            if (text.length <= budget) return { body: text, trimmed: false }
+            const head = text.slice(0, Math.floor(budget * 0.65))
+            const tail = text.slice(-Math.floor(budget * 0.3))
+            const omitted = text.length - head.length - tail.length
+            return {
+              body: `${head}\n\n[... ${omitted} characters omitted ...]\n\n${tail}`,
+              trimmed: true,
+            }
+          }
+          // A step that did not run has an empty outcome.
+          const outcome = value => value || 'skipped'
+
+          const planText = read('plan')
+          const plan = trim(planText, PLAN_BUDGET)
+          const validate = trim(read('validate'), VALIDATE_BUDGET)
+          const scan = trim(read('checkov'), SCAN_BUDGET)
+
+          // The counts matter more than the full plan. So they are shown
+          // outside the collapsed section, where trimming cannot reach them.
+          const summary = planText.match(/^(Plan:.*|No changes\..*|Error:.*)$/m)
+
+          // A plan that only changes outputs prints no `Plan:` line at all.
+          const outputsOnly = /^Changes to Outputs:$/m.test(planText)
+          const summaryLine = summary
+            ? summary[0]
+            : outputsOnly
+              ? 'No infrastructure changes. Outputs only.'
+              : 'Plan summary unavailable'
+
+          // Every action the plan takes, by address. These are also shown
+          // outside the collapsed section. A long plan is trimmed from the
+          // middle, and an important destroy could be anywhere in it.
+          // Destroys and replacements come first, because they lose something.
+          const RANK = { 'must be replaced': 0, 'will be destroyed': 1 }
+          const actions = planText
+            .split('\n')
+            .map(l => l.trim())
+            .filter(l => /^# \S+ (will be|must be|has moved to)/.test(l))
+            .map(l => l.slice(2))
+            .sort((a, b) => {
+              const rank = l => {
+                const m = Object.keys(RANK).find(k => l.includes(k))
+                return m === undefined ? 2 : RANK[m]
+              }
+              return rank(a) - rank(b) || a.localeCompare(b)
+            })
+          const shownActions = []
+          let actionBudget = ACTION_BUDGET
+          for (const a of actions) {
+            if (actionBudget - a.length < 0) break
+            actionBudget -= a.length + 1
+            shownActions.push(a)
+          }
+          const omittedActions = actions.length - shownActions.length
+          const actionList = actions.length === 0 ? '' : [
+            '',
+            '<details open><summary>Actions</summary>',
+            '',
+            '```',
+            ...shownActions,
+            ...(omittedActions > 0
+              ? [`[... ${omittedActions} more, see the run log ...]`]
+              : []),
+            '```',
+            '',
+            '</details>',
+          ].join('\n')
+          const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+          const note = (plan.trimmed || validate.trimmed || scan.trimmed)
+            ? `\n> Output was trimmed to fit a comment. Full log: ${runUrl}\n`
+            : ''
+
+          // One comment per root and calling workflow. The comment is found by
+          // a marker, not by its heading. That way, two roots or two workflows
+          // do not overwrite each other's comments.
+          const marker = `<!-- terraform:${context.workflow}:${env.SLUG} -->`
+
+          const problems = JSON.parse(env.PROBLEMS || '[]')
+          const approval = problems.length === 0 ? [] : [
+            '',
+            `> Planned in \`${env.ENVIRONMENT}\` after approval, because its provider or backend settings could not be compared with the default branch:`,
+            ...problems.map(p => `> - ${p}`),
+            '',
+          ]
+
+          const sections = [
+            marker,
+            `#### \`${env.ROOT}\``,
+            ...approval,
+            `#### Terraform Format and Style \u{1F58C} \`${outcome(env.FMT)}\``,
+            `#### Terraform Initialization \u{2699}️ \`${outcome(env.INIT)}\``,
+            `#### Terraform Validation \u{1F916} \`${outcome(env.VALIDATE)}\``,
+            '<details><summary>Validation Output</summary>',
+            '',
+            '```',
+            validate.body,
+            '```',
+            '',
+            '</details>',
+            '',
+            `#### Terraform Plan \u{1F4D6} \`${outcome(env.PLAN)}\``,
+            '',
+            `\`${summaryLine}\``,
+            actionList,
+            note,
+            '<details><summary>Show Plan</summary>',
+            '',
+            '```',
+            plan.body,
+            '```',
+            '',
+            '</details>',
+          ]
+          if (env.SCAN) {
+            sections.push(
+              '',
+              `#### Policy Scan \u{1F50E} \`${env.SCAN}\``,
+              '',
+              '<details><summary>Show Findings</summary>',
+              '',
+              '```',
+              scan.body,
+              '```',
+              '',
+              '</details>',
+            )
+          }
+          sections.push(
+            '',
+            `*Pusher: @${context.actor}, Action: \`${context.eventName}\`, Workflow: \`${context.workflow}\`*`,
+          )
+          const output = sections.join('\n')
+
+          const body = output.length > COMMENT_LIMIT
+            ? `${output.slice(0, COMMENT_LIMIT - 200)}\n\n[... comment truncated ...] ${runUrl}`
+            : output
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+          const botComment = comments.find(
+            c => c.user.type === 'Bot' && c.body.includes(marker)
+          )
+
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body,
+            })
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            })
+          }
+
+    # Runs after the pull request comment. So a failure is still explained in
+    # the comment, not only shown as a red X.
+    - name: Check Status
+      if: >-
+        steps.fmt.outcome == 'failure' ||
+        steps.init.outcome == 'failure' ||
+        steps.modules.outcome == 'failure' ||
+        steps.validate.outcome == 'failure' ||
+        steps.plan.outcome == 'failure' ||
+        steps.scan.outcome == 'failure'
+      run: exit 1
+
+    - name: Upload the plan
+      if: >-
+        !github.event.pull_request &&
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: tfplan-${{ matrix.root.slug }}
+        path: code/${{ matrix.root.path }}/tfplan
+        retention-days: 1
+        if-no-files-found: error
+
+  # Comments on roots that are not planned yet. Their provider or backend
+  # settings did not pass, and there was no approval environment to plan them
+  # in. This job passes. The pull request can still be reviewed and merged, and
+  # the roots are planned then.
+  deferred:
+    name: 'Not planned yet'
+    needs: [config, roots]
+    if: needs.roots.outputs.deferred != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+    - name: Comment on the pull request
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        DEFERRED: ${{ needs.roots.outputs.deferred }}
+        APPROVAL_PROBLEM: ${{ needs.config.outputs.approval-problem }}
+      with:
+        script: |
+          const deferred = JSON.parse(process.env.DEFERRED)
+          const why = process.env.APPROVAL_PROBLEM
+            ? `The approval environment was not used, because ${process.env.APPROVAL_PROBLEM}`
+            : 'No approval environment is set.'
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+
+          for (const root of deferred) {
+            const marker = `<!-- terraform:${context.workflow}:${root.slug} -->`
+            const body = [
+              marker,
+              `#### \`${root.path}\``,
+              '#### Not planned yet \u{1F6A7}',
+              '',
+              'Its provider or backend settings could not be compared with the default branch, so it will be planned when this is merged:',
+              '',
+              ...root.problems.map(p => `- ${p}`),
+              '',
+              `${why} If a setting above cannot change where credentials are sent, it can be listed in the provider's \`safe-settings\`, in the config file.`,
+            ].join('\n')
+            core.warning(`${root.path} is not planned until it is merged.`)
+
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker))
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              })
+            }
+          }
+
+  # A single check to make required. Each plan job is named for its root. If no
+  # root changed, no plan job runs. So no plan job can be required directly.
+  terraform:
+    name: 'Terraform'
+    needs: [config, roots, plan, deferred]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    steps:
+    - name: Check the plans
+      env:
+        CONFIG: ${{ needs.config.result }}
+        ROOTS: ${{ needs.roots.result }}
+        PLAN: ${{ needs.plan.result }}
+        DEFERRED: ${{ needs.deferred.result }}
+      run: |
+        echo "config: $CONFIG, roots: $ROOTS, plan: $PLAN, deferred: $DEFERRED"
+        if [ "$CONFIG" = skipped ]; then
+          echo "::error::Pull requests from forks are not planned."
+        fi
+        ok() { [ "$1" = success ] || [ "$1" = skipped ]; }
+        [ "$CONFIG" = success ] && [ "$ROOTS" = success ] && ok "$PLAN" && ok "$DEFERRED"
+
+  apply:
+    # Named for the root only. The matrix entries come from the plan job. They
+    # include the environment each root was planned in, which is not this one.
+    name: 'Apply (${{ matrix.root.path }})'
+    needs: [config, roots, plan]
+    if: >-
+      !github.event.pull_request &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment: ${{ needs.config.outputs.apply-environment }}
+
+    strategy:
+      # One root at a time, stopping at the first failure. Roots share no
+      # resources. But they do share a person's attention during an incident.
+      # And a half-applied pair is harder to reason about than a stopped one.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        root: ${{ fromJSON(needs.roots.outputs.plan) }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Check the commit is the latest
+      uses: $/.github/actions/check-latest
+
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.sha }}
+        path: trusted
+        persist-credentials: false
+
+    - name: Prepare Terraform
+      uses: $/.github/actions/prepare-terraform
+      with:
+        terraform-version: ${{ needs.config.outputs.terraform-version }}
+        providers: ${{ needs.config.outputs.providers }}
+
+    # The same three steps as in the plan job.
+    - name: Export environment variables
+      uses: $/.github/actions/export-environment-variables
+      with:
+        variables: ${{ needs.config.outputs.environment-variables }}
+        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
+        vars: ${{ toJSON(vars) }}
+        environment: ${{ needs.config.outputs.apply-environment }}
+
+    - name: Get credentials
+      if: hashFiles('trusted/.github/terraform-pipeline/credentials/action.yml', 'trusted/.github/terraform-pipeline/credentials/action.yaml') != ''
+      uses: ./trusted/.github/terraform-pipeline/credentials # zizmor: ignore[self-repository] the caller's action, not this repository's
+      with:
+        root: ${{ matrix.root.path }}
+        secrets: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets] the names are the caller's, and unknown here
+        vars: ${{ toJSON(vars) }}
+
+    - name: Let git fetch private modules
+      if: needs.config.outputs.private-modules
+      uses: $/.github/actions/module-token
+      with:
+        owner: ${{ fromJSON(needs.config.outputs.private-modules).owner || github.repository_owner }}
+        client-id: ${{ fromJSON(needs.config.outputs.private-modules).client-id }}
+        private-key: ${{ secrets[fromJSON(needs.config.outputs.private-modules).private-key-secret] }} # zizmor: ignore[overprovisioned-secrets] one secret, named by the config
+        private-key-secret: ${{ fromJSON(needs.config.outputs.private-modules).private-key-secret }}
+        environment: ${{ needs.config.outputs.apply-environment }}
+
+    - name: Download the plan
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: tfplan-${{ matrix.root.slug }}
+        path: trusted/${{ matrix.root.path }}
+
+    - name: Terraform Init
+      working-directory: trusted/${{ matrix.root.path }}
+      run: terraform-init
+
+    # Applying a saved plan does exactly what was reviewed. If the state has
+    # changed since the plan, Terraform refuses the file. It does not apply
+    # something different.
+    - name: Terraform Apply
+      working-directory: trusted/${{ matrix.root.path }}
+      run: terraform apply -no-color tfplan 2>&1 | inert

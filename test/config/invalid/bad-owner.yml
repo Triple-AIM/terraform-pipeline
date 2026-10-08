@@ -1,0 +1,10 @@
+# expect: `private-modules.owner` must be an organization's name.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+environments:
+  modules: terraform-modules
+private-modules:
+  owner: github.com/Triple-AIM
+  client-id: Iv23liexample
+  private-key-secret: MODULES_APP_KEY

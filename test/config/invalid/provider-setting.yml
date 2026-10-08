@@ -1,0 +1,5 @@
+# expect: `providers.hashicorp/aws.safe_settings` is not a setting.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/aws:
+    safe_settings: [region]

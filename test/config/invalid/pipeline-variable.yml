@@ -1,0 +1,6 @@
+# expect: `TF_CLI_CONFIG_FILE` is used by the pipeline
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+environment-variables:
+  TF_CLI_CONFIG_FILE: CONFIG

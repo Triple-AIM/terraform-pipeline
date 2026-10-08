@@ -1,0 +1,66 @@
+name: 'Read the config'
+description: >-
+  Reads the pipeline's config file and checks it. Every mistake is reported,
+  and any mistake stops the run. Each setting becomes an output, with its
+  default filled in.
+
+inputs:
+  file:
+    description: 'The config file, relative to the repository.'
+    required: true
+  checkout:
+    description: 'Where the repository is checked out.'
+    required: true
+  terraform-version:
+    description: "Used instead of the config file's version, if set."
+    default: ''
+
+outputs:
+  terraform-version:
+    value: ${{ steps.read.outputs.terraform-version }}
+  providers:
+    description: 'Their addresses, one per line.'
+    value: ${{ steps.read.outputs.providers }}
+  safe-settings:
+    description: 'One line per provider or backend, as `ADDRESS: setting ...` or `backend TYPE: setting ...`.'
+    value: ${{ steps.read.outputs.safe-settings }}
+  root-directory:
+    value: ${{ steps.read.outputs.root-directory }}
+  shared-paths:
+    description: 'One per line.'
+    value: ${{ steps.read.outputs.shared-paths }}
+  plan-environment:
+    value: ${{ steps.read.outputs.plan-environment }}
+  apply-environment:
+    value: ${{ steps.read.outputs.apply-environment }}
+  modules-environment:
+    description: 'Empty if not set.'
+    value: ${{ steps.read.outputs.modules-environment }}
+  approval-environment:
+    description: 'Empty if not set.'
+    value: ${{ steps.read.outputs.approval-environment }}
+  environment-variables:
+    description: >-
+      A JSON map from a variable's name to a secret's name, or to
+      `{"variable": NAME}`.
+    value: ${{ steps.read.outputs.environment-variables }}
+  private-modules:
+    description: 'The `private-modules` setting as JSON. Empty if not set.'
+    value: ${{ steps.read.outputs.private-modules }}
+  checkov:
+    description: '`true` or `false`.'
+    value: ${{ steps.read.outputs.checkov }}
+  checkov-config:
+    value: ${{ steps.read.outputs.checkov-config }}
+
+runs:
+  using: composite
+  steps:
+  - name: Read the config
+    id: read
+    shell: bash
+    env:
+      CONFIG: ${{ inputs.checkout }}/${{ inputs.file }}
+      NAME: ${{ inputs.file }}
+      VERSION: ${{ inputs.terraform-version }}
+    run: '"$GITHUB_ACTION_PATH/read.sh"'

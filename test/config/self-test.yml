@@ -1,0 +1,26 @@
+# The self-test's config. Its environments let any branch use them, so that a
+# pull request can test its own pipeline. They hold nothing.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+root-directory: test/roots
+# Every root is planned on every change. Some claims read a plan's log, so
+# a change to anything must still plan.
+shared-paths:
+  - .
+environments:
+  plan: self-test-plan
+  apply: self-test-apply
+  modules: self-test-modules
+  # This exists but requires no reviewer. So the pipeline should refuse it.
+  approval: self-test-approve
+# The App can only read the test module's repository. Its key is in the plan,
+# apply and modules environments.
+private-modules:
+  client-id: Iv23liwmfTe5Z6qNmSfH
+  private-key-secret: SELF_TEST_MODULES_APP_KEY
+environment-variables:
+  SELF_TEST_API_KEY: SELF_TEST_API_KEY
+  SELF_TEST_USER: { variable: SELF_TEST_USER }
+checkov: true
+checkov-config: test/checkov.yml

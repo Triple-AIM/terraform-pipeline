@@ -1,0 +1,17 @@
+name: 'Check the commit is the latest'
+description: >-
+  Stops the job unless the run's commit is still the latest on the default
+  branch. A re-run keeps the commit it started with. So without this, a
+  re-run of an old run would use that commit's pipeline and config, with
+  today's environments.
+
+runs:
+  using: composite
+  steps:
+  - name: Check the commit is the latest
+    shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT: ${{ github.event_name }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    run: '"$GITHUB_ACTION_PATH/check.sh"'

@@ -1,0 +1,6 @@
+# expect: `backends.s3` must be empty, or a map with `safe-settings`.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/aws:
+backends:
+  s3: key

@@ -1,0 +1,23 @@
+name: 'Install the comparison'
+description: >-
+  Builds the tool that compares a pull request's provider and backend
+  settings with the default branch, at
+  $RUNNER_TEMP/terraform-tools/compare/compare.
+
+runs:
+  using: composite
+  steps:
+  - name: Setup Go
+    uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+    with:
+      go-version: '1.27.1'
+      # Pull request runs must never write to the cache.
+      cache: false
+
+  # Built from source. Go checks every dependency against go.sum.
+  - name: Build
+    shell: bash
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly -trimpath
+    run: go build -C "$GITHUB_ACTION_PATH" -o "$RUNNER_TEMP/terraform-tools/compare/compare" .

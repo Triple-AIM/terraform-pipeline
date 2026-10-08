@@ -1,0 +1,707 @@
+name: 'Self-test'
+
+# Runs this commit's pipeline against the fixtures under test/. It also checks
+# each claim the README makes. A step named "Claim: ..." states its claim in
+# the README's words. It fails if the claim stops being true.
+#
+# Unlike a real caller, it uses `pull_request`. That way, a pull request tests
+# the pipeline it changes. This is only safe because these environments hold
+# nothing.
+#
+# It also runs every week, with the latest Terraform. So a change in
+# Terraform, the runners or the actions shows up, even if this repository has
+# not changed.
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: self-test/${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    # Named explicitly. Only an explicit `bash` adds `-e -o pipefail`.
+    shell: bash
+
+jobs:
+  terraform:
+    uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
+    # Without this, a called workflow gets no secrets. That includes the
+    # environment's secrets.
+    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    permissions:
+      # To read the approval environment's protection rules.
+      actions: read
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      config-file: test/config/self-test.yml
+      terraform-version: ${{ github.event_name == 'schedule' && 'latest' || '' }}
+      # Testing a pull request's own pipeline needs `pull_request`. It also
+      # needs the pull request's branch to use these environments.
+      allow-unprotected-environments: true
+
+  # Two calls of the pipeline at once, with the same config. The pipeline's
+  # concurrency group should make the second wait for the first. The claim
+  # below checks that they did not overlap.
+  concurrency-first:
+    name: 'Concurrency A'
+    uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
+    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      config-file: test/config/concurrency.yml
+      allow-unprotected-environments: true
+
+  concurrency-second:
+    name: 'Concurrency B'
+    uses: ./.github/workflows/terraform.yml # zizmor: ignore[self-repository] the same commit either way
+    secrets: inherit # zizmor: ignore[secrets-inherit] the environment's secrets cannot arrive any other way
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      pull-requests: write
+    with:
+      config-file: test/config/concurrency.yml
+      allow-unprotected-environments: true
+
+  concurrency:
+    name: 'Claims: concurrency'
+    needs: [concurrency-first, concurrency-second]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+
+    steps:
+    - name: 'Claim: runs of the pipeline in the same group wait for each other'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" --jq '.jobs[]' | jq -s .)
+        # When each call's jobs started and ended. Skipped jobs are left out,
+        # because they never ran.
+        span() {
+          jq -c --arg p "$1 / " '[.[] | select((.name | startswith($p)) and .conclusion != "skipped")]
+            | {jobs: length, start: (map(.started_at) | min), end: (map(.completed_at) | max)}' <<<"$jobs"
+        }
+        a=$(span 'Concurrency A')
+        b=$(span 'Concurrency B')
+        echo "A: $a"
+        echo "B: $b"
+        jq -e '.jobs > 0' <<<"$a" > /dev/null && jq -e '.jobs > 0' <<<"$b" > /dev/null
+        if jq -n -e --argjson a "$a" --argjson b "$b" '$a.start < $b.end and $b.start < $a.end' > /dev/null; then
+          echo "::error::The two calls of the pipeline ran at the same time."
+          exit 1
+        fi
+
+  # Runs the settings check against the cases under test/compare. A pull
+  # request here cannot test it through the pipeline itself. Under
+  # `pull_request`, the "default branch" it compares with is the pull
+  # request's own merge commit.
+  comparison:
+    name: 'Comparison'
+    runs-on: ubuntu-latest
+    # For the test App's private key.
+    environment: self-test-modules
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    # The pipeline's own actions, loaded as the pipeline loads them.
+    - uses: $/.github/actions/prepare-terraform
+      with:
+        terraform-version: ${{ github.event_name == 'schedule' && 'latest' || '1.16.1' }}
+        providers: hashicorp/aws
+
+    - uses: $/.github/actions/install-comparison
+
+    - name: 'Claim: the settings check gives the right answer in every case'
+      run: test/compare/run.sh "$RUNNER_TEMP/terraform-tools/compare/compare"
+
+    # Without a token, the fixture's module cannot be installed. That shows
+    # its repository is private, so the claims below mean something.
+    - name: The private module cannot be installed without a token
+      env:
+        GIT_TERMINAL_PROMPT: '0'
+      run: |
+        TRUSTED="$GITHUB_WORKSPACE" CODE="$GITHUB_WORKSPACE" \
+        DATA="$RUNNER_TEMP/terraform/private-without" OUT="$RUNNER_TEMP/private-without.json" \
+        ROOT_DIRECTORY=test/claims/private-module ROOTS='["test/claims/private-module"]' \
+          "$RUNNER_TEMP/terraform-tools/compare/compare" 2>&1 | inert
+        jq -r '.["test/claims/private-module"] // [] | .[]' "$RUNNER_TEMP/private-without.json" > "$RUNNER_TEMP/problems.txt"
+        inert "$RUNNER_TEMP/problems.txt"
+        if ! grep -q 'could not be installed' "$RUNNER_TEMP/problems.txt"; then
+          echo "::error::The module was installed without a token. If its repository is public, the claims below are not tested."
+          exit 1
+        fi
+
+    - name: Read the self-test's App
+      id: app
+      run: echo "client-id=$(yq '."private-modules"."client-id"' test/config/self-test.yml)" >> "$GITHUB_OUTPUT"
+
+    # The pipeline's own action, with the self-test's App.
+    - name: Let git fetch private modules
+      uses: $/.github/actions/module-token
+      with:
+        owner: ${{ github.repository_owner }}
+        client-id: ${{ steps.app.outputs.client-id }}
+        private-key: ${{ secrets.SELF_TEST_MODULES_APP_KEY }}
+        private-key-secret: SELF_TEST_MODULES_APP_KEY
+        environment: self-test-modules
+
+    - name: 'Claim: a root is found by its backend or cloud block, in any file'
+      run: |
+        found=$(CODE="$GITHUB_WORKSPACE" ROOT_DIRECTORY=test/claims/roots "$RUNNER_TEMP/terraform-tools/compare/compare" roots)
+        expected=$(jq -Rsc 'split("\n") | map(select(length > 0))' test/claims/roots/expect)
+        echo "Found: $found"
+        if [ "$found" != "$expected" ]; then
+          echo "::error::Expected $expected"
+          exit 1
+        fi
+
+        # A file that cannot be read stops the search, rather than hide a root.
+        if CODE="$GITHUB_WORKSPACE" ROOT_DIRECTORY=test/claims/roots-unreadable "$RUNNER_TEMP/terraform-tools/compare/compare" roots; then
+          echo "::error::A directory with a file that cannot be read was not reported."
+          exit 1
+        fi
+
+    - name: 'Claim: the settings check can install a private module'
+      env:
+        GIT_TERMINAL_PROMPT: '0'
+      run: |
+        TRUSTED="$GITHUB_WORKSPACE" CODE="$GITHUB_WORKSPACE" \
+        DATA="$RUNNER_TEMP/terraform/private-with" OUT="$RUNNER_TEMP/private-with.json" \
+        ROOT_DIRECTORY=test/claims/private-module ROOTS='["test/claims/private-module"]' \
+          "$RUNNER_TEMP/terraform-tools/compare/compare" 2>&1 | inert
+        jq -r '.["test/claims/private-module"] // [] | .[]' "$RUNNER_TEMP/private-with.json" > "$RUNNER_TEMP/problems.txt"
+        inert "$RUNNER_TEMP/problems.txt"
+        if [ -s "$RUNNER_TEMP/problems.txt" ]; then
+          echo "::error::The settings check did not pass a root whose only change is a private module."
+          exit 1
+        fi
+
+    - name: "Claim: a private module's token is not written into Terraform's working files"
+      run: |
+        data="$RUNNER_TEMP/terraform/private-with"
+        # The module was cloned there. So a search that finds nothing means
+        # something.
+        [ -n "$(find "$data" -name .git -type d -print -quit)" ]
+        # The action gives git the token only as a header in the environment.
+        basic=$(env | sed -n 's/^GIT_CONFIG_VALUE_[0-9]*=AUTHORIZATION: basic //p')
+        [ -n "$basic" ] && [ "$(wc -l <<<"$basic")" -eq 1 ]
+        TOKEN=$(base64 -d <<<"$basic" | cut -d: -f2-)
+        [ -n "$TOKEN" ]
+        if grep -rqF -e "$TOKEN" -e "$basic" "$data"; then
+          echo "::error::The token was written into Terraform's working files, where Terraform code can read it."
+          exit 1
+        fi
+
+  # Claims that planning the fixtures cannot show. Each one is about something
+  # the pipeline refuses. Each runs the pipeline's own steps.
+  claims:
+    name: 'Claims'
+    runs-on: ubuntu-latest
+    permissions:
+      # To read the environments' rules.
+      actions: read
+      contents: read
+      # To read its own OIDC subject.
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - uses: $/.github/actions/prepare-terraform
+      with:
+        terraform-version: ${{ github.event_name == 'schedule' && 'latest' || '1.16.1' }}
+        # The external provider runs programs, for the claim about the
+        # runner's variables.
+        providers: |
+          hashicorp/random
+          hashicorp/external
+
+    - name: "Claim: Terraform code cannot read its own environment, the home directory, or files the sandbox does not grant"
+      working-directory: test/claims/sandbox
+      run: |
+        # Each of these exists. So a read that fails was refused.
+        echo marker > "$HOME/claims-home-file"
+        echo marker > "$RUNNER_TEMP/claims-runner-temp-file"
+        ln -sfn /proc/self/environ environ-link
+        [ -r "$HOME/claims-home-file" ] && [ -r "$RUNNER_TEMP/claims-runner-temp-file" ] && [ -L environ-link ] && [ -r /etc/passwd ]
+        export TF_VAR_home_file="$HOME/claims-home-file"
+        export TF_VAR_runner_temp_file="$RUNNER_TEMP/claims-runner-temp-file"
+        terraform init -no-color 2>&1 | inert
+        terraform plan -no-color 2>&1 | inert
+
+    - name: "Claim: programs that Terraform starts do not get the runner's own variables, such as the token that requests OIDC tokens"
+      working-directory: test/claims/runner-variables
+      env:
+        TF_DATA_DIR: ${{ runner.temp }}/terraform/runner-variables
+        CLAIMS_MARKER: passed on
+      run: |
+        # This job can request OIDC tokens. So the variables are there to
+        # leave out.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::This job has no token for requesting OIDC tokens, so this claim is not tested."
+          exit 1
+        fi
+        terraform init -no-color 2>&1 | inert
+        terraform plan -no-color 2>&1 | inert
+
+    - name: 'Claim: a run stops if its commit is no longer the latest on the default branch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: push
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        latest=$(gh api "repos/$GITHUB_REPOSITORY/commits/heads/$DEFAULT_BRANCH" --jq .sha)
+        # The control. The latest commit passes.
+        GITHUB_SHA=$latest .github/actions/check-latest/check.sh 2>&1 | inert
+
+        # The commit before it does not.
+        older=$(gh api "repos/$GITHUB_REPOSITORY/commits/$latest" --jq '.parents[0].sha')
+        if GITHUB_SHA=$older .github/actions/check-latest/check.sh > "$RUNNER_TEMP/out.txt" 2>&1; then
+          inert "$RUNNER_TEMP/out.txt"
+          echo "::error::A run on an older commit went on."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/out.txt"
+        grep -q 'but the default branch is now at' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: a plan stops if its modules differ from the ones the settings check compared'
+      env:
+        ROOT: test/roots/example
+      run: |
+        data="$RUNNER_TEMP/terraform/modules-claim"
+        mkdir -p "$data/modules/example"
+        echo 'variable "x" {}' > "$data/modules/example/main.tf"
+        compared=$(module-hash "$data")
+
+        # The control. The same modules pass.
+        MODULES=$(jq -nc --arg r "$ROOT" --arg h "$compared" '{($r): $h}') TF_DATA_DIR=$data \
+          test/run-step.sh 'Check the modules are the ones compared' plan 2>&1 | inert
+
+        # A module whose code changed does not. Nor does a root with no record.
+        echo 'variable "y" {}' >> "$data/modules/example/main.tf"
+        for modules in "$(jq -nc --arg r "$ROOT" --arg h "$compared" '{($r): $h}')" '{}'; do
+          if MODULES=$modules TF_DATA_DIR=$data test/run-step.sh 'Check the modules are the ones compared' plan > "$RUNNER_TEMP/out.txt" 2>&1; then
+            inert "$RUNNER_TEMP/out.txt"
+            echo "::error::A plan went on with modules the settings check did not compare."
+            exit 1
+          fi
+          inert "$RUNNER_TEMP/out.txt"
+          grep -Eq 'modules changed after the settings check|left no record of this root' "$RUNNER_TEMP/out.txt"
+        done
+
+        # Nor does a module installed under a path named .git, which the hash
+        # would leave out. Nor does a manifest that cannot be read. Each is
+        # tried in a copy of its own.
+        try() {
+          if module-hash "$1" > "$RUNNER_TEMP/out.txt" 2>&1; then
+            inert "$RUNNER_TEMP/out.txt"
+            echo "::error::module-hash went on: $2"
+            exit 1
+          fi
+          inert "$RUNNER_TEMP/out.txt"
+          grep -Eq "$3" "$RUNNER_TEMP/out.txt"
+        }
+        copy() { rm -rf "$1"; cp -R "$data" "$1"; }
+
+        copy "$data-file"
+        mkdir -p "$data-file/modules/example/.git"
+        echo 'variable "z" {}' > "$data-file/modules/example/.git/main.tf"
+        try "$data-file" 'a Terraform file under .git' 'Terraform file is under a path named .git'
+
+        copy "$data-dir"
+        echo '{"Modules": [{"Key": "example", "Dir": ".terraform/modules/example/.git"}]}' > "$data-dir/modules/modules.json"
+        try "$data-dir" 'a module directory under .git' 'module is installed under a path named .git'
+
+        copy "$data-manifest"
+        echo '{"Modules": [{"Key": "example"}]}' > "$data-manifest/modules/modules.json"
+        try "$data-manifest" 'a manifest that cannot be read' 'manifest could not be read'
+
+        # The control. A manifest that names no .git path is accepted.
+        copy "$data-control"
+        echo '{"Modules": [{"Key": "example", "Dir": ".terraform/modules/example"}]}' > "$data-control/modules/modules.json"
+        module-hash "$data-control" > /dev/null
+
+    - name: Roots whose names would clash stop the run
+      env:
+        PULL_REQUEST: ''
+      run: |
+        out="$RUNNER_TEMP/clash-output"
+        # The control. Different names pass.
+        : > "$out"
+        GITHUB_OUTPUT="$out" ALL='["a/b", "a/c", "x"]' PICKED='["a/b"]' test/run-step.sh 'Compare with the default branch' roots 2>&1 | inert
+        grep -q '^plan=' "$out"
+
+        : > "$out"
+        # Only one of the two is planned in this run. They still clash.
+        if GITHUB_OUTPUT="$out" ALL='["a/b-c", "a-b/c"]' PICKED='["a/b-c"]' test/run-step.sh 'Compare with the default branch' roots > "$RUNNER_TEMP/out.txt" 2>&1; then
+          inert "$RUNNER_TEMP/out.txt"
+          echo "::error::Two roots with the same name were planned."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/out.txt"
+        grep -q 'Some roots get the same name' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: the pipeline will not run with a mistake in its config file'
+      run: test/config/run.sh
+
+    - name: 'Claim: a secret or variable that is not set stops the job, and says which'
+      run: test/export/run.sh
+
+    - name: 'Claim: a lock file made on another platform works'
+      working-directory: test/claims/macos-lock
+      # Only an explicit `bash` adds `-o pipefail`. Without it, a command
+      # piped through `inert` could fail and the step still pass.
+      shell: bash
+      env:
+        # Its own, because this root has a backend and the other claims do
+        # not. Terraform would refuse to switch between them.
+        TF_DATA_DIR: ${{ runner.temp }}/terraform/macos-lock
+      run: |
+        # The control. Adding the Linux hash to a copy must change it. So the
+        # lock file has no Linux hash, and the commands below cannot pass by
+        # matching one.
+        copy="$RUNNER_TEMP/terraform/linux-lock"
+        mkdir -p "$copy"
+        cp main.tf .terraform.lock.hcl "$copy/"
+        terraform -chdir="$copy" providers lock -platform=linux_amd64 -no-color 2>&1 | inert
+        if cmp -s .terraform.lock.hcl "$copy/.terraform.lock.hcl"; then
+          echo "::error::The lock file already has the Linux hash, so this claim is not tested."
+          exit 1
+        fi
+
+        # The pipeline's init. Then the commands that check the installed
+        # providers against the lock file, as a plan does.
+        terraform-init
+        terraform validate -no-color 2>&1 | inert
+        terraform plan -no-color 2>&1 | inert
+
+    - name: "Claim: the pipeline stops if a lock file would change in any way but gaining this platform's hashes"
+      shell: bash
+      env:
+        TF_DATA_DIR: ${{ runner.temp }}/terraform/lock-reformatted
+      run: |
+        # The root above, as committed, with one line of its lock file not as
+        # Terraform writes it. So when init adds the Linux hash, it also
+        # rewrites that line.
+        copy="$RUNNER_TEMP/terraform/lock-reformatted-root"
+        mkdir -p "$copy"
+        cp test/claims/macos-lock/main.tf "$copy/"
+        git show HEAD:test/claims/macos-lock/.terraform.lock.hcl |
+          sed 's/^  version     = /  version = /' > "$copy/.terraform.lock.hcl"
+        if ! grep -q '^  version = ' "$copy/.terraform.lock.hcl"; then
+          echo "::error::The lock file was not changed, so this claim is not tested."
+          exit 1
+        fi
+
+        cd "$copy"
+        if terraform-init > "$RUNNER_TEMP/init.txt" 2>&1; then
+          inert "$RUNNER_TEMP/init.txt"
+          echo "::error::The lock file changed in another way, and init still passed."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/init.txt"
+        # It failed at the check, not earlier.
+        grep -q "changed the lock file in more ways than adding this platform's hashes" "$RUNNER_TEMP/init.txt"
+
+    - name: 'Claim: only providers on the list can be installed'
+      working-directory: test/claims/unlisted-provider
+      run: |
+        if terraform init -no-color > "$RUNNER_TEMP/init.txt" 2>&1; then
+          inert "$RUNNER_TEMP/init.txt"
+          echo "::error::A provider that is not on the list was installed."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/init.txt"
+        grep -q 'hashicorp/null' "$RUNNER_TEMP/init.txt"
+
+    - name: "Claim: Terraform's working directory is outside the checkout"
+      working-directory: test/claims/working-directory
+      run: |
+        terraform init -no-color 2>&1 | inert
+        if [ -e .terraform ]; then
+          echo "::error::Terraform wrote its working directory into the checkout."
+          exit 1
+        fi
+        ls -d "$TF_DATA_DIR/providers/registry.terraform.io/hashicorp/random"
+
+    - name: 'Claim: the pipeline will not run under the usual pull_request trigger'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: pull_request
+        PLAN_ENVIRONMENT: terraform-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: 'false'
+      run: |
+        if test/run-step.sh 'Check the environments' > "$RUNNER_TEMP/out.txt" 2>&1; then
+          inert "$RUNNER_TEMP/out.txt"
+          echo "::error::The pipeline agreed to run under pull_request."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/out.txt"
+        # It stopped for this reason, not another.
+        grep -q 'the branch controls the workflow' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: the pipeline will not run if a plan or apply environment allows other branches'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: pull_request_target
+        PLAN_ENVIRONMENT: self-test-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: 'false'
+      run: |
+        if test/run-step.sh 'Check the environments' > "$RUNNER_TEMP/out.txt" 2>&1; then
+          inert "$RUNNER_TEMP/out.txt"
+          echo "::error::The pipeline accepted a plan environment that any branch may use."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/out.txt"
+        grep -q 'self-test-plan. cannot be used: it is not restricted to named branches' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: the pipeline will not run if the modules environment allows other branches'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: pull_request_target
+        PLAN_ENVIRONMENT: terraform-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        MODULES_ENVIRONMENT: self-test-modules
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: 'false'
+      run: |
+        if test/run-step.sh 'Check the environments' > "$RUNNER_TEMP/out.txt" 2>&1; then
+          inert "$RUNNER_TEMP/out.txt"
+          echo "::error::The pipeline accepted a modules environment that any branch may use."
+          exit 1
+        fi
+        inert "$RUNNER_TEMP/out.txt"
+        grep -q 'self-test-modules. cannot be used: it is not restricted to named branches' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: the pipeline runs when its environments allow only the default branch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: pull_request_target
+        PLAN_ENVIRONMENT: terraform-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        MODULES_ENVIRONMENT: terraform-modules
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: 'false'
+      run: test/run-step.sh 'Check the environments' 2>&1 | inert
+
+    - name: 'Claim: the pipeline shows the OIDC subject for each environment'
+      env:
+        PLAN_ENVIRONMENT: terraform-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        MODULES_ENVIRONMENT: terraform-modules
+      run: |
+        test/run-step.sh 'Show the OIDC subjects' > "$RUNNER_TEMP/subjects.txt" 2>&1
+        inert "$RUNNER_TEMP/subjects.txt"
+        for name in terraform-plan terraform-apply terraform-modules; do
+          grep -Eq "^\| \`$name\` \| \`repo:[^:]+:environment:$name\` \|$" "$RUNNER_TEMP/subjects.txt"
+        done
+
+    - name: 'Claim: the pipeline does not use an approval environment that does not require a reviewer'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: pull_request_target
+        PULL_REQUEST: '1'
+        PLAN_ENVIRONMENT: terraform-plan
+        APPLY_ENVIRONMENT: terraform-apply
+        APPROVAL_ENVIRONMENT: self-test-approve
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ALLOW_UNPROTECTED: 'false'
+      run: |
+        out="$RUNNER_TEMP/approval-output"
+        : > "$out"
+        GITHUB_OUTPUT="$out" test/run-step.sh 'Check the environments' 2>&1 | inert
+        cat "$out"
+        grep -q '^approval-problem=it does not require a reviewer\.$' "$out"
+        ! grep -q '^approval=' "$out"
+
+    # Checked by the job below, which reads this job's annotations.
+    - name: 'Claim: workflow commands in Terraform output are not acted on'
+      run: |
+        echo '::notice::claims-control: printed without the filter, so this one appears'
+        echo '::notice::claims-filtered: printed through the filter, so this one must not appear' | inert
+
+  annotations:
+    name: 'Claims: annotations'
+    needs: claims
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+
+    steps:
+    - name: 'Claim: workflow commands in Terraform output are not acted on'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        check=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+          --jq '.jobs[] | select(.name == "Claims") | .check_run_url | split("/") | last')
+        # A job's annotations can appear a few seconds after it ends. So this
+        # waits for the control, for up to a minute.
+        for _ in $(seq 12); do
+          messages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/check-runs/$check/annotations" --jq '.[].message')
+          grep -q '^claims-control:' <<<"$messages" && break
+          sleep 5
+        done
+        echo "$messages"
+        # The control proves that an obeyed command would show up here. So
+        # the filtered command's absence means something.
+        grep -q '^claims-control:' <<<"$messages"
+        if grep -q '^claims-filtered:' <<<"$messages"; then
+          echo "::error::A workflow command printed through the filter was acted on."
+          exit 1
+        fi
+
+  # Reads the log of one of the pipeline's plan jobs. The self-test's
+  # credentials action prints the environment's key, a secret, and its user,
+  # a variable.
+  masking:
+    name: 'Claims: masking'
+    needs: terraform
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+
+    steps:
+    - name: "Claim: a variable's value is not hidden in the logs"
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        job=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+          --jq '.jobs[] | select(.name | startswith("terraform / Plan (")) | .id' | sed -n 1p)
+        if [ -z "$job" ]; then
+          echo "::error::There is no plan job whose log could be read."
+          exit 1
+        fi
+        # A log has terminal escape sequences, which gh refuses to print
+        # unless told to.
+        log=$(gh api --allow-escape-sequences "repos/$GITHUB_REPOSITORY/actions/jobs/$job/logs")
+        # The control proves that the log shows masking. So the user's value
+        # in full means it was not masked.
+        if ! grep -qE 'Z Key: \*\*\*$' <<<"$log"; then
+          echo "::error::The log does not show the secret masked, so it cannot show the variable unmasked."
+          exit 1
+        fi
+        if ! grep -qE 'Z User: self-test-plan-user$' <<<"$log"; then
+          echo "::error::The variable's value is not in the log in full."
+          grep -E 'Z User: ' <<<"$log" || true
+          exit 1
+        fi
+        echo "The secret is masked, and the variable is not."
+
+  # A branch other than the default branch tries to use the plan environment,
+  # from a workflow of its own. The attempt runs on the
+  # self-test/environment-rules branch, which has a commit of its own. So its
+  # expected failure does not show as a failing check anywhere else.
+  environment-rules:
+    name: 'Claims: environment rules'
+    runs-on: ubuntu-latest
+    permissions:
+      # To start the attempt and read how it ended.
+      actions: write
+      checks: read
+
+    steps:
+    - name: "Claim: a branch's own workflow cannot use the plan environment"
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BRANCH: self-test/environment-rules
+        MARKER: ${{ github.run_id }}-${{ github.run_attempt }}
+      run: |
+        gh workflow run environment-rules.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH" -f marker="$MARKER"
+
+        title="Environment rules: expected to fail ($MARKER)"
+        for _ in $(seq 60); do
+          sleep 10
+          # shellcheck disable=SC2016 # $t is jq's, not the shell's
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow environment-rules.yml --branch "$BRANCH" \
+            --event workflow_dispatch --json databaseId,displayTitle,status,conclusion 2>/dev/null |
+            jq -c --arg t "$title" '.[] | select(.displayTitle == $t)' || true)
+          [ -n "$run" ] && [ "$(jq -r .status <<<"$run")" = completed ] && break
+        done
+        echo "The branch's attempt: $run"
+        [ "$(jq -r .conclusion <<<"$run")" = failure ]
+
+        # It must have failed for the right reason, which is the environment's
+        # branch rules.
+        id=$(jq -r .databaseId <<<"$run")
+        check=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" --jq '.jobs[0].check_run_url | split("/") | last')
+        reasons=$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$check/annotations" --jq '.[].message')
+        echo "$reasons"
+        grep -q 'is not allowed to deploy to terraform-plan due to environment protection rules' <<<"$reasons"
+
+  lint:
+    name: 'Lint'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: The sandbox compiles
+      run: python3 -m py_compile .github/actions/prepare-terraform/sandbox.py
+
+    - name: shellcheck
+      run: >-
+        docker run --rm -v "$PWD:/repo:ro" -w /repo --entrypoint shellcheck
+        rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        .github/actions/prepare-terraform/prepare.sh
+        .github/actions/prepare-terraform/inert
+        .github/actions/read-config/read.sh
+        .github/actions/export-environment-variables/export.sh
+        .github/actions/prepare-terraform/module-hash
+        .github/actions/module-token/git-header.sh
+        .github/actions/check-latest/check.sh
+        test/run-step.sh test/compare/run.sh test/config/run.sh test/export/run.sh
+
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.27.1'
+        cache: false
+
+    - name: go vet
+      working-directory: .github/actions/install-comparison
+      env:
+        GOTOOLCHAIN: local
+        GOFLAGS: -mod=readonly
+      run: go vet ./...
+
+    # This includes shellcheck, which checks the script in each `run`.
+    - name: actionlint
+      run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+    - name: zizmor
+      uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+      with:
+        version: 1.30.1
+        advanced-security: false
+        online-audits: false

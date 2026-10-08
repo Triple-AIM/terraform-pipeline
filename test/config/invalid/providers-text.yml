@@ -1,0 +1,4 @@
+# expect: `providers` must be a map from each provider's address to its settings.
+terraform-version: "1.16.1"
+providers:
+  - hashicorp/random

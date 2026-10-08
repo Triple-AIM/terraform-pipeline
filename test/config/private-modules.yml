@@ -1,0 +1,15 @@
+# Only for the config tests, which must accept it. No workflow uses it.
+terraform-version: "1.16.1"
+providers:
+  hashicorp/aws:
+    safe-settings: [region, default_tags]
+  hashicorp/random:
+backends:
+  s3:
+    safe-settings: [key]
+environments:
+  modules: terraform-modules
+private-modules:
+  owner: Triple-AIM
+  client-id: Iv23liexample
+  private-key-secret: MODULES_APP_KEY

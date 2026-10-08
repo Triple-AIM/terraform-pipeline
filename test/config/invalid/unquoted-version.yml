@@ -1,0 +1,4 @@
+# expect: `terraform-version` must be in quotes.
+terraform-version: 1.10
+providers:
+  hashicorp/random:
