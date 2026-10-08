@@ -103,6 +103,9 @@ runners or the actions shows up even when this repository has not changed.
 - Terraform code cannot read its own environment, the home directory, or
   files the sandbox does not grant. This includes reading its environment
   through a link in the workspace.
+- The sandbox example in
+  [Getting started](#9-open-a-pull-request) shows no warning in the
+  sandbox. Outside it, the example shows its error message.
 - Programs that Terraform starts do not get the runner's own variables, such
   as the token that requests OIDC tokens.
 - Only providers on the list can be installed.
@@ -842,13 +845,26 @@ on the pull request.
 To see the sandbox at work, add this to a root in a pull request:
 
 ```hcl
+locals {
+  sandbox_probe_own_file    = "${path.module}/main.tf"
+  sandbox_probe_environment = "/proc/self/environ"
+}
+
 check "sandbox" {
   assert {
-    condition     = !can(filebase64("/proc/self/environ"))
+    condition     = can(file(local.sandbox_probe_own_file))
+    error_message = "Terraform code cannot read its own configuration, so this probe proves nothing."
+  }
+  assert {
+    condition     = !can(filebase64(local.sandbox_probe_environment))
     error_message = "Terraform code can read its own environment."
   }
 }
 ```
+
+Put it in the root's `main.tf`, or change the first path to the file you
+put it in. The first check is a control. If Terraform could read nothing at
+all, the second check would pass without showing anything.
 
 If the sandbox holds, the plan shows no warning. If it does not, the plan
 shows the error message. In both cases, nothing from the file is printed.
