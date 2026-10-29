@@ -5,7 +5,8 @@ name: 'Terraform'
 #
 # - `pull_request_target`
 # - `push` to the default branch
-# - `workflow_dispatch`, if you want to plan and apply by hand
+# - `workflow_dispatch`, if you want to plan and apply by hand. A run by hand
+#   plans every root.
 #
 # Its settings come from a config file, not from inputs. So they can be lists
 # and maps, and a mistake in them stops the run.
@@ -236,7 +237,8 @@ jobs:
 
   # Finds the roots to plan. A root is a directory with a backend, so roots are
   # found rather than listed. A change plans the roots it touches. A change to
-  # a shared path, or to a workflow, plans every root.
+  # a shared path, or to a workflow, plans every root. For a push, the change
+  # is everything since the last commit that was applied in full.
   #
   # For a pull request, this job also compares each root's provider and
   # backend settings with the default branch. It does that here because this
@@ -250,12 +252,15 @@ jobs:
     # environment.
     environment: ${{ github.event.pull_request && needs.config.outputs.modules-environment || '' }}
     permissions:
+      # To find the last commit that was applied in full.
+      deployments: read
       contents: read
       pull-requests: read
     outputs:
       plan: ${{ steps.compare.outputs.plan }}
       deferred: ${{ steps.compare.outputs.deferred }}
       modules: ${{ steps.compare.outputs.modules }}
+      applied-task: ${{ steps.pick.outputs.applied-task }}
 
     steps:
     - name: Check the commit is the latest
@@ -286,6 +291,11 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         PULL_REQUEST: ${{ github.event.pull_request.number }}
+        EVENT: ${{ github.event_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        APPLY_ENVIRONMENT: ${{ needs.config.outputs.apply-environment }}
+        WORKFLOW: ${{ github.workflow }}
+        CONFIG_FILE: ${{ inputs.config-file }}
         ROOT_DIRECTORY: ${{ needs.config.outputs.root-directory }}
         SHARED_PATHS: ${{ needs.config.outputs.shared-paths }}
       run: |
@@ -315,12 +325,15 @@ jobs:
           return 1
         }
 
-        # The default branch plans every root, not only the ones its commit
-        # changed. A run that is waiting behind another is cancelled when a
-        # newer one arrives. The newer run then has to apply its changes too.
-        # Planning a root that did not change only costs a refresh. Skipping
-        # one that did change would leave that change unapplied.
+        # A run that applies every root it planned records a deployment of
+        # its commit, with this task. The task is named for the workflow and
+        # the config file, as the concurrency group is. So two callers never
+        # read each other's.
+        applied_task="terraform-pipeline/applied/$(printf '%s\n%s' "$WORKFLOW" "$CONFIG_FILE" | sha256sum | cut -c1-16)"
+        echo "applied-task=$applied_task" >> "$GITHUB_OUTPUT"
+
         every=true
+        changed=""
         if [ -n "$PULL_REQUEST" ]; then
           # The files API stops at 3000 files. A list cut short would look
           # complete, so a larger pull request plans every root.
@@ -329,7 +342,46 @@ jobs:
             every=false
             changed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST/files" --jq '.[].filename, (.[].previous_filename // empty)')
           fi
+        elif [ "$EVENT" = push ]; then
+          # A push plans the roots changed since the last commit that was
+          # applied in full. That is not always the commit before this one.
+          # A run that waits behind another is cancelled when a newer one
+          # arrives, and a run can fail. Either way it records nothing. So the
+          # next run plans that run's changes too.
+          #
+          # Only a deployment that a workflow's token recorded, and that
+          # succeeded, counts. That leaves out any recorded by a person.
+          base=""
+          deployments=$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$(jq -rn --arg e "$APPLY_ENVIRONMENT" '$e | @uri')&task=$(jq -rn --arg t "$applied_task" '$t | @uri')&per_page=100" |
+            jq -r '.[] | select(.creator.login == "github-actions[bot]") | "\(.id) \(.sha)"')
+          while read -r id sha; do
+            [ -n "$id" ] || continue
+            if gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses?per_page=100" | jq -e 'any(.[]; .state == "success")' > /dev/null; then
+              base=$sha
+              break
+            fi
+          done <<<"$deployments"
+
+          # The comparison lists at most 300 files. A list cut short would
+          # look complete, so a longer one plans every root. So does a base
+          # that is not in this commit's history, such as after a force push.
+          if [ -z "$base" ]; then
+            echo "No commit on $DEFAULT_BRANCH was applied in full yet, so every root is planned."
+          else
+            # GitHub cannot compare commits with no history in common.
+            comparison=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$GITHUB_SHA") || comparison='{}'
+            status=$(jq -r '.status // "unknown"' <<<"$comparison")
+            count=$(jq '.files // [] | length' <<<"$comparison")
+            if { [ "$status" = ahead ] || [ "$status" = identical ]; } && [ "$count" -lt 300 ]; then
+              every=false
+              changed=$(jq -r '.files // [] | .[] | .filename, (.previous_filename // empty)' <<<"$comparison")
+              echo "Planning the roots changed since $base, the last commit applied in full."
+            else
+              echo "The changes since $base, the last commit applied in full, cannot be listed, so every root is planned."
+            fi
+          fi
         fi
+        # Any other event, such as a run by hand, plans every root.
 
         # A shared path of `.` is the top directory. It holds every file, so
         # any change touches it.
@@ -574,7 +626,20 @@ jobs:
       id: plan
       if: steps.init.outcome == 'success' && steps.modules.outcome != 'failure'
       working-directory: code/${{ matrix.root.path }}
-      run: terraform plan -no-color -out=tfplan 2>&1 | tee "$RUNNER_TEMP/plan.txt" | inert
+      run: |
+        # With -detailed-exitcode, a plan with changes exits with 2, and one
+        # without exits with 0. Only a plan with changes is applied.
+        set +e
+        terraform plan -no-color -detailed-exitcode -out=tfplan 2>&1 | tee "$RUNNER_TEMP/plan.txt" | inert
+        codes=("${PIPESTATUS[@]}")
+        set -e
+        [ "${codes[1]}" = 0 ] || exit 1
+        [ "${codes[2]}" = 0 ] || exit 1
+        case "${codes[0]}" in
+          0) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+          2) echo "changes=true" >> "$GITHUB_OUTPUT" ;;
+          *) exit "${codes[0]}" ;;
+        esac
       continue-on-error: true
 
     # Scans both the configuration and the plan, because each catches things
@@ -865,13 +930,16 @@ jobs:
         steps.scan.outcome == 'failure'
       run: exit 1
 
+    # The name says whether the plan has changes, and which attempt of the run
+    # made it. The Changes job applies a root only if its latest plan has
+    # changes.
     - name: Upload the plan
       if: >-
         !github.event.pull_request &&
         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: tfplan-${{ matrix.root.slug }}
+        name: ${{ steps.plan.outputs.changes == 'true' && 'tfplan' || 'noplan' }}-${{ matrix.root.slug }}-attempt-${{ github.run_attempt }}
         path: code/${{ matrix.root.path }}/tfplan
         retention-days: 1
         if-no-files-found: error
@@ -964,14 +1032,58 @@ jobs:
         ok() { [ "$1" = success ] || [ "$1" = skipped ]; }
         [ "$CONFIG" = success ] && [ "$ROOTS" = success ] && ok "$PLAN" && ok "$DEFERRED"
 
-  apply:
-    # Named for the root only. The matrix entries come from the plan job. They
-    # include the environment each root was planned in, which is not this one.
-    name: 'Apply (${{ matrix.root.path }})'
+  # Picks the roots to apply. Each plan job saves its plan, under a name that
+  # says whether it has changes. A re-run of only the failed jobs keeps the
+  # other plans from the earlier attempt. So each root's latest plan decides.
+  changes:
+    name: 'Changes'
     needs: [config, roots, plan]
     if: >-
       !github.event.pull_request &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      apply: ${{ steps.pick.outputs.apply }}
+
+    steps:
+    - name: Pick the roots whose plan has changes
+      id: pick
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PLANNED: ${{ needs.roots.outputs.plan }}
+      run: |
+        saved=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" | jq -s '[.[].artifacts[].name]')
+        # The latest attempt that saved a plan of this kind for this root.
+        latest=$(jq -c --argjson saved "$saved" '
+          def latest($kind; $slug): "\($kind)-\($slug)-attempt-" as $prefix
+            | [$saved[] | select(startswith($prefix)) | ltrimstr($prefix) | select(test("^[0-9]+$")) | tonumber] | max;
+          [.[] | . + {changes: latest("tfplan"; .slug), none: latest("noplan"; .slug)}]' <<<"$PLANNED")
+
+        # Every planned root must have a saved plan. Otherwise its changes
+        # would be skipped, and recording this commit would skip them for good.
+        missing=$(jq -r '[.[] | select(.changes == null and .none == null) | .path] | join(", ")' <<<"$latest")
+        if [ -n "$missing" ]; then
+          echo "::error::No plan was saved for: $missing"
+          exit 1
+        fi
+
+        apply=$(jq -c '[.[] | select(.changes != null and (.none == null or .changes > .none))
+          | del(.none) + {artifact: "tfplan-\(.slug)-attempt-\(.changes)"} | del(.changes)]' <<<"$latest")
+        echo "apply=$apply" >> "$GITHUB_OUTPUT"
+        echo "Applying: $apply"
+
+  apply:
+    # Named for the root only. The matrix entries come from the Roots job,
+    # through the Changes job. They include the environment each root was
+    # planned in, which is not this one.
+    name: 'Apply (${{ matrix.root.path }})'
+    needs: [config, roots, plan, changes]
+    if: >-
+      !github.event.pull_request &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      needs.changes.outputs.apply != '[]'
     runs-on: ubuntu-latest
     environment: ${{ needs.config.outputs.apply-environment }}
 
@@ -982,7 +1094,7 @@ jobs:
       max-parallel: 1
       fail-fast: true
       matrix:
-        root: ${{ fromJSON(needs.roots.outputs.plan) }}
+        root: ${{ fromJSON(needs.changes.outputs.apply) }}
 
     permissions:
       contents: read
@@ -1033,7 +1145,7 @@ jobs:
     - name: Download the plan
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: tfplan-${{ matrix.root.slug }}
+        name: ${{ matrix.root.artifact }}
         path: trusted/${{ matrix.root.path }}
 
     - name: Terraform Init
@@ -1046,3 +1158,46 @@ jobs:
     - name: Terraform Apply
       working-directory: trusted/${{ matrix.root.path }}
       run: terraform apply -no-color tfplan 2>&1 | inert
+
+  # Records that this commit is applied in full, as a deployment to the apply
+  # environment. The next push plans only the roots changed since. It runs
+  # only if every root with changes was applied, or none had any. A run that
+  # fails or is cancelled records nothing.
+  applied:
+    name: 'Applied'
+    needs: [config, roots, plan, changes, apply]
+    if: >-
+      !cancelled() &&
+      !github.event.pull_request &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      needs.config.result == 'success' &&
+      needs.roots.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.plan.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.changes.result) &&
+      contains(fromJSON('["success", "skipped"]'), needs.apply.result)
+    runs-on: ubuntu-latest
+    permissions:
+      deployments: write
+
+    steps:
+    - name: Record the commit
+      env:
+        GH_TOKEN: ${{ github.token }}
+        APPLY_ENVIRONMENT: ${{ needs.config.outputs.apply-environment }}
+        TASK: ${{ needs.roots.outputs.applied-task }}
+        WORKFLOW: ${{ github.workflow }}
+        CONFIG_FILE: ${{ inputs.config-file }}
+      run: |
+        # The checks on this commit are still running, so none is required.
+        # Other deployments to the environment are left as they are.
+        id=$(jq -n --arg ref "$GITHUB_SHA" --arg environment "$APPLY_ENVIRONMENT" --arg task "$TASK" \
+          --arg workflow "$WORKFLOW" --arg config "$CONFIG_FILE" '{
+            ref: $ref, environment: $environment, task: $task,
+            auto_merge: false, required_contexts: [],
+            payload: {workflow: $workflow, "config-file": $config},
+            description: "Every root with changes was applied."}' |
+          gh api "repos/$GITHUB_REPOSITORY/deployments" --input - --jq .id)
+        gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" \
+          -f state=success -F auto_inactive=false \
+          -f log_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > /dev/null
+        echo "Recorded $GITHUB_SHA as applied in full, in deployment $id."

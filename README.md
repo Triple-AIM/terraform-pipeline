@@ -136,6 +136,9 @@ runners or the actions shows up even when this repository has not changed.
 - A variable that is not set stops the job, and says which.
 - A variable's value is not hidden in the logs.
 - A root is found by its backend or cloud block, in any file.
+- A merge plans only the roots changed since the last commit that was
+  applied in full. If those changes cannot be listed, it plans every root.
+- A root whose plan has no changes is not applied.
 - A lock file made on another platform works.
 - The pipeline stops if a lock file would change in any way but gaining this
   platform's hashes.
@@ -566,10 +569,31 @@ On merge, the pipeline plans your default branch, saves the plan to a file,
 and applies that exact file. If anything changes between the plan and the
 apply, Terraform refuses to apply it.
 
-Each merge plans every root, not only the ones it changed. When merges queue
-up, GitHub cancels a run that is still waiting once a newer one arrives. The
-newer run then has to apply the cancelled run's changes too. Planning a root
-that did not change only costs a refresh.
+A merge plans the roots changed since the last commit that was applied in
+full. That is not always the commit before it. When merges queue up, GitHub
+cancels a run that is still waiting once a newer one arrives. A run can also
+fail. Either way, the next run plans that run's changes too.
+
+A run that applies every root it planned records its commit as a
+deployment to the apply environment. It shows in the environment's history,
+with the task `terraform-pipeline/applied/...`. The pipeline plans every root
+when it cannot tell what changed:
+
+- No run has recorded a commit yet.
+- The recorded commit is not in the merge's history, such as after a force
+  push.
+- 300 or more files changed since then.
+- The run was started by hand.
+
+A root whose plan has no changes is not applied. Only the roots whose plan
+has changes get an Apply job.
+
+Only a deployment recorded by a workflow's token counts, not one recorded by
+a person. But a workflow on any branch can record one. So anyone who can
+push a branch could make a merge skip roots whose changes were never
+applied. They cannot make anything be applied, or reach a credential. If
+your workflow also runs on `workflow_dispatch`, a run by hand plans every
+root again.
 
 ### Third-party code is pinned
 
@@ -598,7 +622,17 @@ can accept these trade-offs:
 - **Pull requests from forks are never planned.**
 - **Each pull request takes a little longer.** The settings check installs
   the modules of every root on your default branch, to compare against.
-- **Each merge plans every root.** See
+- **A merge plans only the roots whose files changed.** So:
+  - A change to a local module outside your roots plans nothing, unless the
+    module is under one of your `shared-paths`.
+  - A root that reads another root's resources, through a data source or
+    `terraform_remote_state`, is not planned when that other root changes.
+    It picks up the change the next time it is planned.
+  - A change outside the repository's files plans nothing. That includes a
+    repository or environment variable. So does a change to a config file
+    kept outside `.github/` and your `shared-paths`.
+
+  A run by hand plans every root. See
   [Apply uses a saved plan](#apply-uses-a-saved-plan).
 
 ## Getting started
@@ -805,10 +839,12 @@ jobs:
     secrets:
       TERRAFORM_PIPELINE_MODULES_APP_KEY: ${{ secrets.TERRAFORM_PIPELINE_MODULES_APP_KEY }}
     # A called workflow cannot have more than this. The pipeline needs
-    # `actions: read` to check your environments' rules.
+    # `actions: read` to check your environments' rules, and
+    # `deployments: write` to record each commit it applies in full.
     permissions:
       actions: read
       contents: read
+      deployments: write
       id-token: write
       pull-requests: write
 ```
@@ -826,7 +862,8 @@ The pull request that adds these files is not planned. Under
 and the default branch does not have it yet. The config file is not checked
 until then either.
 
-The merge plans and applies every root. So before you merge:
+The first merge plans every root, and applies each one whose plan has
+changes. So before you merge:
 
 - Check that each root's plan shows no changes, or only changes you want.
 - Turn off your old pipeline's applies in the same pull request. Otherwise
@@ -836,7 +873,9 @@ The merge plans and applies every root. So before you merge:
   branch.
 
 To check that it worked, look at the run on your default branch. It shows a
-Config job and a Roots job, then a Plan job and an Apply job for each root.
+Config job and a Roots job, then a Plan job for each root. After those come a
+Changes job, an Apply job for each root whose plan has changes, and an
+Applied job.
 If the config file has a mistake, the Config job fails and says what it
 is.
 
