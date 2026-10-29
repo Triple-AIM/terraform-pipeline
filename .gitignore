@@ -5,6 +5,7 @@ tfplan
 test/compare/.work.*
 test/claims/sandbox/environ-link
 test/claims/*/.terraform.lock.hcl
+test/picking/.work.*
 
 # The fixture made on macOS keeps its lock file.
 !test/claims/macos-lock/.terraform.lock.hcl

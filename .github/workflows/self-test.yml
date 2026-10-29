@@ -41,6 +41,7 @@ jobs:
       # To read the approval environment's protection rules.
       actions: read
       contents: read
+      deployments: write
       id-token: write
       pull-requests: write
     with:
@@ -59,6 +60,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      deployments: write
       id-token: write
       pull-requests: write
     with:
@@ -71,6 +73,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      deployments: write
       id-token: write
       pull-requests: write
     with:
@@ -112,6 +115,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      # To read the commit the merge recorded.
+      deployments: read
 
     steps:
     - name: "Claim: the App's key can be passed by name, even if only the environments have it"
@@ -134,6 +139,51 @@ jobs:
           echo "::error::A job that installs the private module did not succeed, or none ran."
           exit 1
         fi
+
+    # The fixtures keep no state between runs, so most have changes in every
+    # plan. The unchanged root manages nothing, so its plan never has any.
+    - name: A merge applies the roots whose plan has changes, and no others
+      if: github.event_name != 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+          --jq '.jobs[] | select(.name | startswith("terraform / ")) | {name, conclusion}' | jq -s .)
+        applies=$(jq -c '[.[] | select(.name | startswith("terraform / Apply ("))]' <<<"$jobs")
+        echo "$applies"
+        # The control. The unchanged root was planned, so its plan had the
+        # chance to show changes.
+        if ! jq -e 'any(.[]; (.name | startswith("terraform / Plan (test/roots/unchanged,")) and .conclusion == "success")' <<<"$jobs" > /dev/null; then
+          echo "::error::The unchanged root was not planned."
+          exit 1
+        fi
+        if ! jq -e 'any(.[]; .name == "terraform / Apply (test/roots/private-module)" and .conclusion == "success")' <<<"$applies" > /dev/null; then
+          echo "::error::The root whose plan has changes was not applied."
+          exit 1
+        fi
+        if jq -e 'any(.[]; .name == "terraform / Apply (test/roots/unchanged)")' <<<"$applies" > /dev/null; then
+          echo "::error::A root whose plan has no changes was applied."
+          exit 1
+        fi
+
+    - name: A merge records its commit as applied in full
+      if: github.event_name != 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WORKFLOW: ${{ github.workflow }}
+      run: |
+        # The task the pipeline gives this call's config.
+        task="terraform-pipeline/applied/$(printf '%s\n%s' "$WORKFLOW" test/config/self-test.yml | sha256sum | cut -c1-16)"
+        ids=$(gh api "repos/$GITHUB_REPOSITORY/deployments?sha=$GITHUB_SHA&per_page=100" |
+          jq -r --arg task "$task" '.[] | select(.task == $task) | .id')
+        for id in $ids; do
+          if gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" --jq '.[].state' | grep -qx success; then
+            echo "Deployment $id records $GITHUB_SHA as applied in full."
+            exit 0
+          fi
+        done
+        echo "::error::The merge did not record its commit as applied in full."
+        exit 1
 
   # Runs the settings check against the cases under test/compare. A pull
   # request here cannot test it through the pipeline itself. Under
@@ -209,6 +259,9 @@ jobs:
           echo "::error::A directory with a file that cannot be read was not reported."
           exit 1
         fi
+
+    - name: 'Claim: a merge plans only the roots changed since the last commit that was applied in full, or every root if those changes cannot be listed'
+      run: test/picking/run.sh plans "$RUNNER_TEMP/terraform-tools/compare/compare"
 
     - name: 'Claim: the settings check can install a private module'
       env:
@@ -426,6 +479,9 @@ jobs:
         fi
         inert "$RUNNER_TEMP/out.txt"
         grep -q 'Some roots get the same name' "$RUNNER_TEMP/out.txt"
+
+    - name: 'Claim: a root whose plan has no changes is not applied'
+      run: test/picking/run.sh applies
 
     - name: 'Claim: the pipeline will not run with a mistake in its config file'
       run: test/config/run.sh
@@ -744,7 +800,7 @@ jobs:
         .github/actions/prepare-terraform/module-hash
         .github/actions/module-token/git-header.sh
         .github/actions/check-latest/check.sh
-        test/run-step.sh test/compare/run.sh test/config/run.sh test/export/run.sh
+        test/run-step.sh test/compare/run.sh test/config/run.sh test/export/run.sh test/picking/run.sh
 
     - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
