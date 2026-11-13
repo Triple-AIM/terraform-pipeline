@@ -167,7 +167,7 @@ if [ "$section" = plans ]; then
   # lists them. Those roots' paths cannot all be worked out, or they name the
   # top directory.
   with_every() {
-    printf '%s\n' "$@" $r/broken $r/climbs $r/device $r/dirname $r/joined $r/outside $r/top | sort | jq -Rnc '[inputs]'
+    printf '%s\n' "$@" $r/broken $r/climbs $r/dirname $r/joined $r/outside $r/top | sort | jq -Rnc '[inputs]'
   }
   reset
   deployments "2 applied $bot success"

@@ -5,9 +5,6 @@
   "roots/climbs": {
     "every": true
   },
-  "roots/device": {
-    "every": true
-  },
   "roots/dirname": {
     "every": true
   },
