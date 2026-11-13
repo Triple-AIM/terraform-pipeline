@@ -1,0 +1,6 @@
+# expect: `checkov-config` must be a path relative to the repository
+terraform-version: "1.16.1"
+providers:
+  hashicorp/random:
+checkov: true
+checkov-config: ./checkov.yml

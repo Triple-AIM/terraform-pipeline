@@ -63,7 +63,8 @@ export APPLY_ENVIRONMENT=terraform-apply
 export WORKFLOW=Terraform
 export CONFIG_FILE=.github/terraform-pipeline/config.yml
 export PULL_REQUEST=''
-export SHARED_PATHS=''
+export CHECKOV=false
+export CHECKOV_CONFIG=''
 export ROOT_DIRECTORY=test/claims/roots
 
 all='["test/claims/roots/backend-file","test/claims/roots/cloud","test/claims/roots/json","test/claims/roots/json-list","test/claims/roots/other-file"]'
@@ -126,8 +127,8 @@ if [ "$section" = plans ]; then
   comparison applied ahead .github/workflows/terraform.yml
   pick 'a push that changes a workflow plans every root' "$all"
 
-  SHARED_PATHS=test/modules/ comparison applied ahead test/modules/pet/main.tf
-  SHARED_PATHS=test/modules/ pick 'a push that changes a shared path plans every root' "$all"
+  comparison applied ahead "$CONFIG_FILE"
+  pick 'a push that changes the config file plans every root' "$all"
 
   comparison applied diverged test/claims/roots/json/main.tf.json
   pick "a push whose last commit applied in full is not in its history plans every root" "$all"
@@ -158,6 +159,43 @@ if [ "$section" = plans ]; then
   reset
   deployments "2 applied $bot success"
   EVENT=workflow_dispatch pick 'a run by hand plans every root' "$all"
+
+  # Roots whose code uses other paths. See test/claims/dependencies.
+  d=test/claims/dependencies
+  r=$d/roots
+  # The roots given, with the roots planned on every change, as the step
+  # lists them. Those roots' paths cannot all be worked out, or they name the
+  # top directory.
+  with_every() {
+    printf '%s\n' "$@" $r/broken $r/climbs $r/device $r/dirname $r/joined $r/outside $r/top | sort | jq -Rnc '[inputs]'
+  }
+  reset
+  deployments "2 applied $bot success"
+
+  comparison applied ahead $d/modules/two/main.tf
+  ROOT_DIRECTORY=$r pick 'a push that changes a module plans each root that uses it, even through another module' \
+    "$(with_every $r/json $r/modules)"
+
+  comparison applied ahead $d/policies/read.json
+  ROOT_DIRECTORY=$r pick 'a push that changes a file that a root names plans that root, even through a link' \
+    "$(with_every $r/paths $r/through-link)"
+
+  comparison applied ahead $d/modules/unused/main.tf
+  ROOT_DIRECTORY=$r pick 'a push that changes a module no root uses plans only the roots planned on every change' \
+    "$(with_every)"
+  claim='the log says why a root is planned on every change'
+  if grep -qF "$r/climbs is planned on every change, because its paths cannot all be worked out: $r/climbs/main.tf:4 climbs out" "$log"; then
+    pass "$claim"
+  else
+    fail "$claim"
+  fi
+
+  comparison applied ahead $d/checkov.yml
+  ROOT_DIRECTORY=$r pick 'a push that changes the Checkov config plans nothing when Checkov is off' \
+    "$(with_every)"
+  ROOT_DIRECTORY=$r CHECKOV=true CHECKOV_CONFIG=$d/checkov.yml pick \
+    'a push that changes the Checkov config plans each root without a config of its own' \
+    "$(with_every $r/json $r/link $r/paths $r/through-link $r/tfvars)"
 
   # The Applied job's record is the one the Roots job looks for.
   reset

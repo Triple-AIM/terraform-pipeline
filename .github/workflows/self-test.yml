@@ -260,7 +260,21 @@ jobs:
           exit 1
         fi
 
-    - name: 'Claim: a merge plans only the roots changed since the last commit that was applied in full, or every root if those changes cannot be listed'
+    - name: "Claim: a root uses its own directory, each local module it calls, and each path its code names. A root whose paths cannot all be worked out is planned on every change"
+      run: |
+        dir=test/claims/dependencies
+        roots=$(CODE="$GITHUB_WORKSPACE" ROOT_DIRECTORY=$dir/roots "$RUNNER_TEMP/terraform-tools/compare/compare" roots)
+        # Paths are given relative to the fixtures. Reasons are not compared.
+        found=$(CODE="$GITHUB_WORKSPACE" ROOTS="$roots" "$RUNNER_TEMP/terraform-tools/compare/compare" dependencies |
+          jq -S --arg d "$dir/" 'with_entries(.key |= ltrimstr($d)
+            | .value |= if .every then {every: true} else .paths |= map(ltrimstr($d)) end)')
+        echo "$found"
+        if [ "$found" != "$(jq -S . $dir/expect.json)" ]; then
+          echo "::error::Expected $(jq -c . $dir/expect.json)"
+          exit 1
+        fi
+
+    - name: 'Claim: a merge plans only the roots that use a path changed since the last commit that was applied in full, or every root if those changes cannot be listed'
       run: test/picking/run.sh plans "$RUNNER_TEMP/terraform-tools/compare/compare"
 
     - name: 'Claim: the settings check can install a private module'

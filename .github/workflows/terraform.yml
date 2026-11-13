@@ -102,7 +102,6 @@ jobs:
       providers: ${{ steps.config.outputs.providers }}
       safe-settings: ${{ steps.config.outputs.safe-settings }}
       root-directory: ${{ steps.config.outputs.root-directory }}
-      shared-paths: ${{ steps.config.outputs.shared-paths }}
       plan-environment: ${{ steps.config.outputs.plan-environment }}
       apply-environment: ${{ steps.config.outputs.apply-environment }}
       modules-environment: ${{ steps.config.outputs.modules-environment }}
@@ -236,9 +235,10 @@ jobs:
         } | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Finds the roots to plan. A root is a directory with a backend, so roots are
-  # found rather than listed. A change plans the roots it touches. A change to
-  # a shared path, or to a workflow, plans every root. For a push, the change
-  # is everything since the last commit that was applied in full.
+  # found rather than listed. A change plans the roots that use a path it
+  # touches. The comparison tool reads each root's code to find those paths.
+  # A change under .github/ or to the config file plans every root. For a push,
+  # the change is everything since the last commit that was applied in full.
   #
   # For a pull request, this job also compares each root's provider and
   # backend settings with the default branch. It does that here because this
@@ -297,11 +297,13 @@ jobs:
         WORKFLOW: ${{ github.workflow }}
         CONFIG_FILE: ${{ inputs.config-file }}
         ROOT_DIRECTORY: ${{ needs.config.outputs.root-directory }}
-        SHARED_PATHS: ${{ needs.config.outputs.shared-paths }}
+        CHECKOV: ${{ needs.config.outputs.checkov }}
+        CHECKOV_CONFIG: ${{ needs.config.outputs.checkov-config }}
       run: |
         # A root is a directory with a backend or cloud block. The tool fails
         # if a file cannot be read, rather than miss a root.
-        all=$(CODE="$PWD" "$RUNNER_TEMP/terraform-tools/compare/compare" roots | jq -r '.[]')
+        roots=$(CODE="$PWD" "$RUNNER_TEMP/terraform-tools/compare/compare" roots)
+        all=$(jq -r '.[]' <<<"$roots")
 
         # These paths come from the branch, and every later job uses them. So
         # they may only use characters that cannot mean anything but a path.
@@ -317,10 +319,14 @@ jobs:
           fi
         done <<<"$all"
 
-        # Whether any changed path starts with the given prefix.
+        # Whether any changed path is the given path, or is under it. The
+        # top directory `.` holds every path.
         touches() {
           while read -r path; do
-            [[ "$path" == "$1"* ]] && return 0
+            [ -n "$path" ] || continue
+            if [ "$1" = . ] || [ "$path" = "$1" ] || [[ "$path" == "$1"/* ]]; then
+              return 0
+            fi
           done <<<"$changed"
           return 1
         }
@@ -383,29 +389,55 @@ jobs:
         fi
         # Any other event, such as a run by hand, plans every root.
 
-        # A shared path of `.` is the top directory. It holds every file, so
-        # any change touches it.
-        if [ "$every" = false ]; then
-          while read -r prefix; do
-            if [ "$prefix" = . ] || { [ -n "$prefix" ] && touches "$prefix"; }; then
-              every=true
-            fi
-          done <<<"$(printf '.github/\n%s\n' "$SHARED_PATHS")"
+        # The workflows and the config file can change how any root is
+        # planned.
+        if [ "$every" = false ] && { touches .github || touches "$CONFIG_FILE"; }; then
+          every=true
         fi
 
-        # The top directory holds every file, so any change touches it.
+        # Each root is planned if a change touches a path its code uses. The
+        # tool says which paths those are. A root whose paths it cannot work
+        # out is planned on every change.
+        uses='{}'
+        if [ "$every" = false ]; then
+          uses=$(CODE="$PWD" ROOTS="$roots" "$RUNNER_TEMP/terraform-tools/compare/compare" dependencies)
+          # A root the tool gave no answer for would never be planned.
+          if ! jq -e --argjson roots "$roots" '. as $uses | all($roots[]; $uses[.] | (.every // .paths[0]) != null)' <<<"$uses" > /dev/null; then
+            echo "::error::The paths of some roots were not worked out."
+            exit 1
+          fi
+          # The reasons quote the branch's code. Each line starts with a root's
+          # checked path, so none of them can be a workflow command.
+          jq -r 'to_entries[] | select(.value.every)
+            | "\(.key) is planned on every change, because its paths cannot all be worked out: \(.value.every | gsub("[[:cntrl:]]"; " "))"' <<<"$uses"
+        fi
         picked=$(while read -r root; do
           [ -n "$root" ] || continue
-          prefix="$root/"
-          [ "$root" != . ] || prefix=""
-          if [ "$every" = true ] || touches "$prefix"; then
+          if [ "$every" = true ]; then
             echo "$root"
+            continue
           fi
+          if jq -e --arg r "$root" '.[$r].every' <<<"$uses" > /dev/null; then
+            echo "$root"
+            continue
+          fi
+          paths=$(jq -r --arg r "$root" '.[$r].paths // [] | .[]' <<<"$uses")
+          # A root with no Checkov config of its own is scanned with the
+          # shared one.
+          if [ "$CHECKOV" = true ] && [ -n "$CHECKOV_CONFIG" ] && [ ! -f "$root/.checkov.yml" ]; then
+            paths=$(printf '%s\n%s' "$paths" "$CHECKOV_CONFIG")
+          fi
+          while read -r path; do
+            if [ -n "$path" ] && touches "$path"; then
+              echo "$root"
+              break
+            fi
+          done <<<"$paths"
         done <<<"$all")
 
         json=$(jq -Rc 'select(length > 0)' <<<"$picked" | jq -sc .)
         echo "roots=$json" >> "$GITHUB_OUTPUT"
-        echo "all=$(jq -Rc 'select(length > 0)' <<<"$all" | jq -sc .)" >> "$GITHUB_OUTPUT"
+        echo "all=$(jq -c . <<<"$roots")" >> "$GITHUB_OUTPUT"
         echo "Picked: $json"
 
     # After this, `terraform` runs Terraform in a Landlock sandbox. It only

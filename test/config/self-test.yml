@@ -4,10 +4,6 @@ terraform-version: "1.16.1"
 providers:
   hashicorp/random:
 root-directory: test/roots
-# Every root is planned on every change. Some claims read a plan's log, so
-# a change to anything must still plan.
-shared-paths:
-  - .
 environments:
   plan: self-test-plan
   apply: self-test-apply

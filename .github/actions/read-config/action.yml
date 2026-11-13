@@ -26,9 +26,6 @@ outputs:
     value: ${{ steps.read.outputs.safe-settings }}
   root-directory:
     value: ${{ steps.read.outputs.root-directory }}
-  shared-paths:
-    description: 'One per line.'
-    value: ${{ steps.read.outputs.shared-paths }}
   plan-environment:
     value: ${{ steps.read.outputs.plan-environment }}
   apply-environment:

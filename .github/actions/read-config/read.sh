@@ -9,6 +9,11 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 name=${NAME:-$CONFIG}
 
+if [ -n "${NAME:-}" ] && ! jq -L "$here" -en --arg path "$NAME" 'include "paths"; $path | clean' > /dev/null; then
+  echo "::error::The config file's path, $NAME, must be relative to the repository, with no \`.\` or \`..\` parts and no extra slashes."
+  exit 1
+fi
+
 if [ ! -f "$CONFIG" ]; then
   echo "::error::There is no config file at $name."
   exit 1
@@ -18,7 +23,7 @@ if ! json=$(yq -o=json '.' "$CONFIG" 2>&1); then
   exit 1
 fi
 
-mistakes=$(jq -r -f "$here/check.jq" <<<"$json")
+mistakes=$(jq -L "$here" -r -f "$here/check.jq" <<<"$json")
 if [ -n "$mistakes" ]; then
   while read -r mistake; do
     echo "::error file=$name::$mistake"
@@ -39,7 +44,6 @@ output providers "$(get '.providers | keys_unsorted | join("\n")')"
 output safe-settings "$(get '[(.providers | to_entries[] | "\(.key): \(.value."safe-settings" // [] | join(" "))"),
   (.backends // {} | to_entries[] | "backend \(.key): \(.value."safe-settings" // [] | join(" "))")] | join("\n")')"
 output root-directory "$(get '."root-directory" // "."')"
-output shared-paths "$(get '."shared-paths" // [] | join("\n")')"
 output plan-environment "$(get '.environments.plan // "terraform-plan"')"
 output apply-environment "$(get '.environments.apply // "terraform-apply"')"
 output modules-environment "$(get '.environments.modules // ""')"

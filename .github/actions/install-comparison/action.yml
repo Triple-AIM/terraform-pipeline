@@ -1,8 +1,8 @@
 name: 'Install the comparison'
 description: >-
-  Builds the tool that compares a pull request's provider and backend
-  settings with the default branch, at
-  $RUNNER_TEMP/terraform-tools/compare/compare.
+  Builds the tool that finds the roots and the paths each one uses, and
+  compares a pull request's provider and backend settings with the default
+  branch, at $RUNNER_TEMP/terraform-tools/compare/compare.
 
 runs:
   using: composite

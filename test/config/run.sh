@@ -41,4 +41,19 @@ for file in "$here"/invalid/*.yml; do
   fi
 done
 
+# The config file's own path must be plain too.
+for name in ./config.yml config//config.yml; do
+  : > "$out"
+  if CONFIG="$here/self-test.yml" NAME=$name GITHUB_OUTPUT="$out" "$read" > "$log" 2>&1; then
+    echo "FAIL the config file's path $name is accepted"
+    failed=1
+  elif grep -qF "The config file's path, $name, must be relative" "$log"; then
+    echo "ok   the config file's path $name is refused"
+  else
+    echo "FAIL the config file's path $name is refused, but not because it is not plain"
+    sed 's/^/     /' "$log"
+    failed=1
+  fi
+done
+
 exit $failed

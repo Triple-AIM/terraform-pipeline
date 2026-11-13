@@ -1,0 +1,4 @@
+{
+  "terraform": {"backend": {"local": {}}},
+  "module": {"two": {"source": "../../modules/two"}}
+}

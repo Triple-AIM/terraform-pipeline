@@ -136,8 +136,12 @@ runners or the actions shows up even when this repository has not changed.
 - A variable that is not set stops the job, and says which.
 - A variable's value is not hidden in the logs.
 - A root is found by its backend or cloud block, in any file.
-- A merge plans only the roots changed since the last commit that was
-  applied in full. If those changes cannot be listed, it plans every root.
+- A root uses its own directory, each local module it calls, and each path
+  its code names. A root whose paths cannot all be worked out is planned on
+  every change.
+- A merge plans only the roots that use a path changed since the last
+  commit that was applied in full. If those changes cannot be listed, it
+  plans every root.
 - A root whose plan has no changes is not applied.
 - A lock file made on another platform works.
 - The pipeline stops if a lock file would change in any way but gaining this
@@ -569,10 +573,11 @@ On merge, the pipeline plans your default branch, saves the plan to a file,
 and applies that exact file. If anything changes between the plan and the
 apply, Terraform refuses to apply it.
 
-A merge plans the roots changed since the last commit that was applied in
-full. That is not always the commit before it. When merges queue up, GitHub
-cancels a run that is still waiting once a newer one arrives. A run can also
-fail. Either way, the next run plans that run's changes too.
+A merge plans the roots that use what changed since the last commit that
+was applied in full. That is not always the commit before it. When merges
+queue up, GitHub cancels a run that is still waiting once a newer one
+arrives. A run can also fail. Either way, the next run plans that run's
+changes too.
 
 A run that applies every root it planned records its commit as a
 deployment to the apply environment. It shows in the environment's history,
@@ -622,15 +627,43 @@ can accept these trade-offs:
 - **Pull requests from forks are never planned.**
 - **Each pull request takes a little longer.** The settings check installs
   the modules of every root on your default branch, to compare against.
-- **A merge plans only the roots whose files changed.** So:
-  - A change to a local module outside your roots plans nothing, unless the
-    module is under one of your `shared-paths`.
+- **A merge plans only the roots that use what changed.** The pipeline
+  reads each root's code to find what it uses:
+  - the root's own directory
+  - each local module it calls, and each module those call
+  - each path its code names, such as
+    `file("${path.module}/../policies/read.json")`
+  - each link on the way to one of those paths, and where the link leads
+
+  A path is followed when one string holds it, until a part whose value is
+  not known. So `"${path.module}/files/${var.name}.json"` counts as the
+  whole `files` directory. A change under `.github/` or to the config file
+  plans every root. A change to `checkov-config` plans each root that has no
+  Checkov config of its own.
+
+  Some uses cannot be seen this way:
+  - A path joined from several strings, such as with `join` or `format`.
+  - A file that a program reads, when the code does not name it. The
+    program might be an `external` data source's script, or a provider. To
+    have the root planned when the file changes, name the file in the code,
+    such as in the script's arguments.
+  - A path written inside a template file that `templatefile` reads.
+  - A module fetched by its address from this same repository. Terraform
+    fetches it from GitHub, not from the change.
   - A root that reads another root's resources, through a data source or
-    `terraform_remote_state`, is not planned when that other root changes.
-    It picks up the change the next time it is planned.
-  - A change outside the repository's files plans nothing. That includes a
-    repository or environment variable. So does a change to a config file
-    kept outside `.github/` and your `shared-paths`.
+    `terraform_remote_state`. It is not planned when that other root
+    changes. It picks up the change the next time it is planned.
+  - A change outside the repository's files, such as to a repository or
+    environment variable.
+
+  Some code uses a path the pipeline cannot follow. Then its root is planned
+  on every change, and the Roots job's log says why. That happens for:
+  - a `..` after a part that is not known, or not plainly a name
+  - a string that is only `..`, such as one passed to `join`
+  - a call to `dirname`
+  - a module source that is an expression
+  - a module directory that does not exist, or is outside the repository
+  - a file that cannot be read, or that leads outside the repository
 
   A run by hand plans every root. See
   [Apply uses a saved plan](#apply-uses-a-saved-plan).
@@ -762,7 +795,6 @@ These are all the settings:
 | `providers` | A map from each provider Terraform may install to its `safe-settings`. | Required |
 | `backends` | A map from a backend's type to its `safe-settings`. | None |
 | `root-directory` | Where to look for roots. | The whole repository |
-| `shared-paths` | Paths that, when changed, plan every root. `.` is the repository's top directory, so it plans every root on every change. | None |
 | `environments` | The names of the `plan`, `apply`, `modules` and `approval` environments. | `terraform-plan` and `terraform-apply` |
 | `environment-variables` | A map from an environment variable's name to `{ variable: NAME }`. | None |
 | `private-modules` | The GitHub App for [private modules](#private-modules), and the organization that owns the modules. | None. The owner defaults to your organization. |
@@ -881,9 +913,8 @@ is.
 
 ### 9. Open a pull request
 
-Change something in one root. The pipeline plans only the roots that the
-pull request touches, unless it touches a shared path. It comments the plan
-on the pull request.
+Change something in one root. The pipeline plans only the roots that use
+what the pull request changes. It comments the plan on the pull request.
 
 To see the sandbox at work, add this to a root in a pull request:
 
@@ -1216,7 +1247,7 @@ actions it loads from this repository:
 - `.github/actions/prepare-terraform` sets up the sandbox. The sandbox itself
   is `sandbox.py`.
 - `.github/actions/install-comparison` builds a small Go program. It finds
-  the roots, and it is the settings check.
+  the roots and the paths each one uses, and it is the settings check.
 - `.github/actions/read-config` reads and checks the config file.
 - `.github/actions/export-environment-variables` exports the variables that
   the config names.

@@ -1,0 +1,67 @@
+{
+  "roots/broken": {
+    "every": true
+  },
+  "roots/climbs": {
+    "every": true
+  },
+  "roots/device": {
+    "every": true
+  },
+  "roots/dirname": {
+    "every": true
+  },
+  "roots/joined": {
+    "every": true
+  },
+  "roots/json": {
+    "paths": [
+      "modules/two",
+      "roots/json"
+    ]
+  },
+  "roots/link": {
+    "paths": [
+      "linked/shared.tf",
+      "roots/link"
+    ]
+  },
+  "roots/modules": {
+    "paths": [
+      "modules/one",
+      "modules/two",
+      "roots/modules"
+    ]
+  },
+  "roots/outside": {
+    "every": true
+  },
+  "roots/paths": {
+    "paths": [
+      "files",
+      "modules/reader",
+      "modules/shared/note.txt",
+      "policies/read.json",
+      "roots/paths",
+      "roots/shared/note.txt"
+    ]
+  },
+  "roots/tfvars": {
+    "paths": [
+      "data/values.json",
+      "roots/tfvars"
+    ]
+  },
+  "roots/through-link": {
+    "paths": [
+      "policies",
+      "roots/through-link",
+      "shortcut"
+    ]
+  },
+  "roots/top": {
+    "paths": [
+      "."
+    ]
+  }
+}
