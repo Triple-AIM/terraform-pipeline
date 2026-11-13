@@ -1,10 +1,12 @@
 # Prints one line for each mistake in the config, given as JSON. Prints
 # nothing if there are none.
 
+include "paths";
+
 def settings: [
   "terraform-version", "providers", "backends", "root-directory",
-  "shared-paths", "environments", "environment-variables", "private-modules",
-  "checkov", "checkov-config"
+  "environments", "environment-variables", "private-modules", "checkov",
+  "checkov-config"
 ];
 def texts: type == "array" and all(.[]; type == "string");
 def identifier: type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$");
@@ -50,9 +52,6 @@ else
 
   (."root-directory" // "." | select(type != "string")
     | "`root-directory` must be a path."),
-
-  (."shared-paths" // [] | select(texts | not)
-    | "`shared-paths` must be a list of paths."),
 
   (.environments // {} |
     if type != "object" then
@@ -105,5 +104,6 @@ else
   else empty end,
 
   (.checkov // false | select(type != "boolean") | "`checkov` must be true or false."),
-  (."checkov-config" // "" | select(type != "string") | "`checkov-config` must be a path.")
+  (."checkov-config" // null | select(. != null and (clean | not))
+    | "`checkov-config` must be a path relative to the repository, with no `.` or `..` parts and no extra slashes.")
 end

@@ -4,9 +4,6 @@ terraform-version: "1.16.1"
 providers:
   hashicorp/random:
 root-directory: test/roots
-# Every root is planned on every change, as in the self-test.
-shared-paths:
-  - .
 environments:
   plan: terraform-plan
   apply: terraform-apply

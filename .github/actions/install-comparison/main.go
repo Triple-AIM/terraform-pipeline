@@ -16,7 +16,8 @@
 // the root cannot be planned yet. A root with no reasons can be planned.
 //
 // Run as `compare roots`, it instead prints the roots under $CODE, as a JSON
-// list of paths relative to it.
+// list of paths relative to it. Run as `compare dependencies`, it prints the
+// paths each root in $ROOTS depends on. See dependencies.go.
 package main
 
 import (
@@ -44,9 +45,31 @@ type block struct {
 	body    map[string]any
 }
 
-type unreadable struct{ reason string }
+// problem says why a root cannot be checked, or why its paths cannot be
+// worked out.
+type problem struct{ reason string }
 
-func (u unreadable) Error() string { return u.reason }
+func (p problem) Error() string { return p.reason }
+
+// The largest configuration file read. Real ones are far smaller.
+const maxSource = 8 << 20
+
+// readSource reads one configuration file. The branch decides what a path
+// leads to. So a path must lead to a regular file of a sensible size, never
+// to a device such as /dev/zero.
+func readSource(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Size() > maxSource {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxSource)
+	}
+	return os.ReadFile(path)
+}
 
 func address(source string) string {
 	parts := strings.Split(strings.ToLower(source), "/")
@@ -206,16 +229,16 @@ func blocks(directory string) ([]block, error) {
 	jsonFiles, _ := filepath.Glob(filepath.Join(directory, "*.tf.json"))
 	for _, path := range jsonFiles {
 		var doc map[string]json.RawMessage
-		src, err := os.ReadFile(path)
+		src, err := readSource(path)
 		if err != nil || json.Unmarshal(src, &doc) != nil {
-			return nil, unreadable{filepath.Base(path) + " could not be read"}
+			return nil, problem{filepath.Base(path) + " could not be read"}
 		}
 		// Any data source counts, not only `terraform_remote_state`. A name
 		// in JSON can be written with escapes, so the raw text cannot be
 		// searched for it.
 		for key := range doc {
 			if !comparableJSON[key] {
-				return nil, unreadable{filepath.Base(path) + " is in the JSON syntax, which cannot be compared"}
+				return nil, problem{filepath.Base(path) + " is in the JSON syntax, which cannot be compared"}
 			}
 		}
 	}
@@ -231,17 +254,17 @@ func blocks(directory string) ([]block, error) {
 	var found []block
 
 	for _, path := range files {
-		src, err := os.ReadFile(path)
+		src, err := readSource(path)
 		if err != nil {
-			return nil, unreadable{filepath.Base(path) + " could not be read"}
+			return nil, problem{filepath.Base(path) + " could not be read"}
 		}
 		file, diags := hclsyntax.ParseConfig(src, path, hcl.InitialPos)
 		if diags.HasErrors() {
-			return nil, unreadable{filepath.Base(path) + " could not be read: " + diags.Error()}
+			return nil, problem{filepath.Base(path) + " could not be read: " + diags.Error()}
 		}
 		for _, b := range file.Body.(*hclsyntax.Body).Blocks {
 			if !knownTypes[b.Type] {
-				return nil, unreadable{fmt.Sprintf("%s has a %q block, which the check does not know", filepath.Base(path), b.Type)}
+				return nil, problem{fmt.Sprintf("%s has a %q block, which the check does not know", filepath.Base(path), b.Type)}
 			}
 			// A check block can hold a data source of its own.
 			var states []*hclsyntax.Block
@@ -256,7 +279,7 @@ func blocks(directory string) ([]block, error) {
 				}
 			}
 			if isOverride(path) && (b.Type == "terraform" || b.Type == "provider" || len(states) > 0) {
-				return nil, unreadable{filepath.Base(path) + " is an override file. Terraform merges its blocks into others, so they cannot be compared one by one"}
+				return nil, problem{filepath.Base(path) + " is an override file. Terraform merges its blocks into others, so they cannot be compared one by one"}
 			}
 			for _, state := range states {
 				found = append(found, remoteState(state, src))
@@ -344,7 +367,7 @@ func modules(root, data string) (map[string]string, error) {
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, unreadable{"Its modules could not be installed:\n" + strings.TrimSpace(stderr.String())}
+		return nil, problem{"Its modules could not be installed:\n" + strings.TrimSpace(stderr.String())}
 	}
 	dirs := map[string]string{"": root}
 	manifest, err := os.ReadFile(filepath.Join(data, "modules", "modules.json"))
@@ -353,7 +376,7 @@ func modules(root, data string) (map[string]string, error) {
 	}
 	var m struct{ Modules []struct{ Key, Dir string } }
 	if err != nil || json.Unmarshal(manifest, &m) != nil {
-		return nil, unreadable{"Its module manifest could not be read"}
+		return nil, problem{"Its module manifest could not be read"}
 	}
 	for _, mod := range m.Modules {
 		if filepath.IsAbs(mod.Dir) {
@@ -376,9 +399,9 @@ func isRoot(directory string) (bool, error) {
 	jsonFiles, _ := filepath.Glob(filepath.Join(directory, "*.tf.json"))
 	for _, path := range jsonFiles {
 		var doc struct{ Terraform json.RawMessage }
-		src, err := os.ReadFile(path)
+		src, err := readSource(path)
 		if err != nil || json.Unmarshal(src, &doc) != nil {
-			return false, unreadable{path + " could not be read"}
+			return false, problem{path + " could not be read"}
 		}
 		// The terraform block is an object, or a list of objects.
 		var settings []map[string]json.RawMessage
@@ -397,13 +420,13 @@ func isRoot(directory string) (bool, error) {
 
 	files, _ := filepath.Glob(filepath.Join(directory, "*.tf"))
 	for _, path := range files {
-		src, err := os.ReadFile(path)
+		src, err := readSource(path)
 		if err != nil {
-			return false, unreadable{path + " could not be read"}
+			return false, problem{path + " could not be read"}
 		}
 		file, diags := hclsyntax.ParseConfig(src, path, hcl.InitialPos)
 		if diags.HasErrors() {
-			return false, unreadable{path + " could not be read: " + diags.Error()}
+			return false, problem{path + " could not be read: " + diags.Error()}
 		}
 		for _, b := range file.Body.(*hclsyntax.Body).Blocks {
 			if b.Type != "terraform" {
@@ -462,6 +485,21 @@ func main() {
 		found, err := roots(code, os.Getenv("ROOT_DIRECTORY"))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Roots could not be found:", err)
+			os.Exit(1)
+		}
+		out, _ := json.Marshal(found)
+		fmt.Println(string(out))
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "dependencies" {
+		var list []string
+		if err := json.Unmarshal([]byte(os.Getenv("ROOTS")), &list); err != nil {
+			fmt.Fprintln(os.Stderr, "ROOTS is not a JSON list:", err)
+			os.Exit(1)
+		}
+		found, err := dependencies(code, list)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Dependencies could not be found:", err)
 			os.Exit(1)
 		}
 		out, _ := json.Marshal(found)
