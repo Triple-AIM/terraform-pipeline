@@ -74,7 +74,11 @@ class RulesetAttr(ctypes.Structure):
     ]
 
 
+# The kernel's struct is packed: 12 bytes, with no padding. Python packs a
+# struct only with the "ms" layout. For plain fields such as these, that
+# layout gives the same bytes as the kernel's.
 class PathBeneathAttr(ctypes.Structure):
+    _layout_ = "ms"
     _pack_ = 1
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
@@ -86,6 +90,11 @@ libc.syscall.restype = ctypes.c_long
 def fail(message):
     print(f"sandbox: {message}", file=sys.stderr)
     sys.exit(125)
+
+
+# A struct the kernel would read wrongly could leave paths unrestricted.
+if ctypes.sizeof(PathBeneathAttr) != 12 or PathBeneathAttr.parent_fd.offset != 8:
+    fail("the path rule's struct does not match the kernel's layout")
 
 
 def check(result, what):
